@@ -1,0 +1,8 @@
+.env
+cookies.json
+__pycache__/
+*.pyc
+monitor.log
+monitor.out
+monitor.err
+bot.pid
