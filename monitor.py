@@ -25,6 +25,11 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "90"))
 CHECK_INTERVAL_MAX = int(os.getenv("CHECK_INTERVAL_MAX", "120"))
+CHECK_INTERVAL_DAY_MIN = int(os.getenv("CHECK_INTERVAL_DAY_MIN", "60"))
+CHECK_INTERVAL_DAY_MAX = int(os.getenv("CHECK_INTERVAL_DAY_MAX", "70"))
+DAY_START_HOUR   = int(os.getenv("DAY_START_HOUR", "7"))
+DAY_END_HOUR     = int(os.getenv("DAY_END_HOUR", "23"))  # верхняя граница НЕ включается
+ERROR_ALERT_THRESHOLD = int(os.getenv("ERROR_ALERT_THRESHOLD", "5"))
 SCHEDULE_ID      = os.getenv("SCHEDULE_ID", "")
 MAX_DATE         = os.getenv("MAX_DATE", "")
 EMAIL            = os.getenv("EMAIL", "")
@@ -172,39 +177,63 @@ async def do_login(client: httpx.AsyncClient) -> dict:
         return {}
 
 
-async def fetch_available_days(client, cookies, bot):
-    headers = build_headers(cookies)
-    try:
-        resp = await client.get(DAYS_URL, headers=headers, timeout=30, follow_redirects=False)
+async def fetch_available_days(client, cookies, bot, max_date: str = MAX_DATE):
+    """Возвращает (dates, cookies). dates=None означает ошибку (а не пустой календарь)."""
+    for attempt in range(2):
+        try:
+            resp = await client.get(DAYS_URL, headers=build_headers(cookies), timeout=30, follow_redirects=False)
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            if attempt == 0:
+                wait = random.randint(5, 10)
+                log.warning(f"Сетевой сбой ({type(e).__name__}), ретрай через {wait}с")
+                await asyncio.sleep(wait)
+                continue
+            log.error(f"Сетевая ошибка после ретрая: {e}")
+            return None, cookies
+        except Exception as e:
+            log.error(f"Ошибка при запросе дней: {e}")
+            return None, cookies
 
         if resp.status_code in (401, 302):
             log.warning("Сессия устарела, выполняю автологин...")
             await send_telegram(bot, "🔄 Сессия устарела, выполняю автологин...")
             new_cookies = await do_login(client)
-            if new_cookies:
-                await send_telegram(bot, "✅ Автологин успешен, сессия восстановлена")
-                resp = await client.get(DAYS_URL, headers=build_headers(new_cookies), timeout=30, follow_redirects=False)
-                cookies = new_cookies
-            else:
+            if not new_cookies:
                 await send_telegram(bot, "❌ Автологин не удался. Обновите EMAIL/PASSWORD в .env")
-                return [], cookies
+                return None, cookies
+            await send_telegram(bot, "✅ Автологин успешен, сессия восстановлена")
+            cookies = new_cookies
+            continue  # повторяем запрос с новыми куками
 
-        resp.raise_for_status()
-        data = resp.json()
+        if resp.status_code == 429:
+            log.warning("Слишком много запросов (429). Увеличьте CHECK_INTERVAL.")
+            return None, cookies
+
+        if 500 <= resp.status_code < 600:
+            if attempt == 0:
+                wait = random.randint(5, 10)
+                log.warning(f"HTTP {resp.status_code}, ретрай через {wait}с")
+                await asyncio.sleep(wait)
+                continue
+            log.error(f"HTTP {resp.status_code} после ретрая")
+            return None, cookies
+
+        if resp.status_code != 200:
+            log.error(f"Неожиданный HTTP статус: {resp.status_code}")
+            return None, cookies
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            log.error(f"Не удалось распарсить JSON ответа: {e}")
+            return None, cookies
+
         dates = [d["date"] for d in data if d.get("business_day", False)]
-        if MAX_DATE:
-            dates = [d for d in dates if d <= MAX_DATE]
+        if max_date:
+            dates = [d for d in dates if d <= max_date]
         return dates, cookies
 
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 429:
-            log.warning("Слишком много запросов (429). Увеличьте CHECK_INTERVAL.")
-        else:
-            log.error(f"HTTP ошибка: {e.response.status_code}")
-        return [], cookies
-    except Exception as e:
-        log.error(f"Ошибка при запросе дней: {e}")
-        return [], cookies
+    return None, cookies
 
 
 async def fetch_times_for_date(client, cookies, date):
@@ -261,62 +290,115 @@ async def main():
                 log.error("Не удалось получить cookies. Проверьте EMAIL и PASSWORD в .env")
                 return
 
-        log.info("Монитор запущен. Проверяю слоты каждые %d-%d сек...", CHECK_INTERVAL_MIN, CHECK_INTERVAL_MAX)
+        log.info(
+            "Монитор запущен. Ночь %d-%d сек, день (%d:00-%d:00) %d-%d сек...",
+            CHECK_INTERVAL_MIN, CHECK_INTERVAL_MAX,
+            DAY_START_HOUR, DAY_END_HOUR,
+            CHECK_INTERVAL_DAY_MIN, CHECK_INTERVAL_DAY_MAX,
+        )
         await send_telegram(
             bot,
             "🤖 <b>Монитор визы США (Астана) запущен</b>\n"
-            f"Интервал проверки: {CHECK_INTERVAL_MIN}-{CHECK_INTERVAL_MAX} сек\n"
+            f"День ({DAY_START_HOUR:02d}:00-{DAY_END_HOUR:02d}:00): {CHECK_INTERVAL_DAY_MIN}-{CHECK_INTERVAL_DAY_MAX} сек\n"
+            f"Ночь: {CHECK_INTERVAL_MIN}-{CHECK_INTERVAL_MAX} сек\n"
             + (f"Ищу слоты до: {MAX_DATE}" if MAX_DATE else "Ищу любые доступные слоты"),
         )
 
         last_known_dates: set = set()
         check_count = 0
+        consecutive_errors = 0
+        blind_alert_sent = False
 
         while True:
             check_count += 1
             log.info(f"[#{check_count}] {datetime.now().strftime('%H:%M:%S')} — проверяю...")
 
-            available, cookies = await fetch_available_days(client, cookies, bot)
-            new_dates = set(available) - last_known_dates
+            is_full_check = check_count % 100 == 0
 
-            if new_dates:
-                details = []
-                for date in sorted(new_dates)[:3]:
-                    times = await fetch_times_for_date(client, cookies, date)
-                    time_str = ", ".join(times[:5]) if times else "нет данных"
-                    if len(times) > 5:
-                        time_str += f" (+{len(times)-5} ещё)"
-                    # Прямая ссылка с датой/временем в query — usvisa-info подхватит как hint
-                    first_time = times[0] if times else ""
-                    deep_link = (
-                        f"{BOOKING_URL}?"
-                        f"appointments[consulate_appointment][facility_id]=134&"
-                        f"appointments[consulate_appointment][date]={date}&"
-                        f"appointments[consulate_appointment][time]={first_time}"
-                    )
-                    details.append(f"  📅 <a href='{deep_link}'><b>{date}</b></a>: {time_str}")
-
-                extra = f"\n  ...и ещё {len(new_dates)-3} дат" if len(new_dates) > 3 else ""
-                msg = (
-                    "🚨 <b>СЛОТЫ ПОЯВИЛИСЬ!</b>\n\n"
-                    + "\n".join(details) + extra
-                    + f"\n\n🔗 <a href='{BOOKING_URL}'>Забронировать сейчас →</a>\n\n"
-                    "⚡️ Действуйте быстро — слоты разбирают за минуты!"
-                )
-                await send_telegram(bot, msg)
-                send_twilio_sms(sorted(new_dates))
-                log.info(f"Найдены новые слоты: {sorted(new_dates)}")
-            elif available:
-                log.info(f"Слоты уже известны ({len(available)} дат), ждём новых...")
+            if is_full_check:
+                # Полная проверка без фильтра по дате — только Telegram, без SMS,
+                # без обновления last_known_dates (не мешаем основному циклу).
+                all_dates, cookies = await fetch_available_days(client, cookies, bot, max_date="")
+                if all_dates is None:
+                    log.warning(f"Полная проверка #{check_count}: ошибка запроса, пропускаю")
+                else:
+                    sorted_all = sorted(all_dates)
+                    limit_note = f" (фильтр обычных проверок: до {MAX_DATE})" if MAX_DATE else ""
+                    if sorted_all:
+                        dates_block = "\n".join(f"  📅 {d}" for d in sorted_all)
+                        msg = (
+                            f"✅ <b>Полная проверка #{check_count}</b> "
+                            f"({datetime.now().strftime('%d.%m.%Y %H:%M')}){limit_note}\n"
+                            f"Все доступные даты ({len(sorted_all)}):\n{dates_block}"
+                        )
+                    else:
+                        msg = (
+                            f"✅ <b>Полная проверка #{check_count}</b> "
+                            f"({datetime.now().strftime('%d.%m.%Y %H:%M')}){limit_note}\n"
+                            "Свободных слотов нет вообще."
+                        )
+                    await send_telegram(bot, msg)
+                    log.info(f"Полная проверка: всего дат {len(sorted_all)}")
             else:
-                log.info("Свободных слотов нет.")
+                available, cookies = await fetch_available_days(client, cookies, bot)
 
-            last_known_dates = set(available)
+                if available is None:
+                    consecutive_errors += 1
+                    log.warning(f"Ошибка запроса (подряд: {consecutive_errors}). Состояние не сбрасываю.")
+                    if consecutive_errors >= ERROR_ALERT_THRESHOLD and not blind_alert_sent:
+                        await send_telegram(
+                            bot,
+                            f"⚠️ <b>Бот ослеп</b>: {consecutive_errors} ошибок подряд.\n"
+                            "Сайт usvisa-info недоступен или сессия не восстанавливается.",
+                        )
+                        blind_alert_sent = True
+                else:
+                    if blind_alert_sent:
+                        await send_telegram(bot, "✅ Связь с сайтом восстановлена")
+                        blind_alert_sent = False
+                    consecutive_errors = 0
 
-            if check_count % 100 == 0:
-                await send_telegram(bot, f"✅ Бот работает. Проверок: {check_count}. Последняя: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+                    new_dates = set(available) - last_known_dates
 
-            interval = random.randint(CHECK_INTERVAL_MIN, CHECK_INTERVAL_MAX)
+                    if new_dates:
+                        details = []
+                        for date in sorted(new_dates)[:3]:
+                            times = await fetch_times_for_date(client, cookies, date)
+                            time_str = ", ".join(times[:5]) if times else "нет данных"
+                            if len(times) > 5:
+                                time_str += f" (+{len(times)-5} ещё)"
+                            # Прямая ссылка с датой/временем в query — usvisa-info подхватит как hint
+                            first_time = times[0] if times else ""
+                            deep_link = (
+                                f"{BOOKING_URL}?"
+                                f"appointments[consulate_appointment][facility_id]=134&"
+                                f"appointments[consulate_appointment][date]={date}&"
+                                f"appointments[consulate_appointment][time]={first_time}"
+                            )
+                            details.append(f"  📅 <a href='{deep_link}'><b>{date}</b></a>: {time_str}")
+
+                        extra = f"\n  ...и ещё {len(new_dates)-3} дат" if len(new_dates) > 3 else ""
+                        msg = (
+                            "🚨 <b>СЛОТЫ ПОЯВИЛИСЬ!</b>\n\n"
+                            + "\n".join(details) + extra
+                            + f"\n\n🔗 <a href='{BOOKING_URL}'>Забронировать сейчас →</a>\n\n"
+                            "⚡️ Действуйте быстро — слоты разбирают за минуты!"
+                        )
+                        await send_telegram(bot, msg)
+                        send_twilio_sms(sorted(new_dates))
+                        log.info(f"Найдены новые слоты: {sorted(new_dates)}")
+                    elif available:
+                        log.info(f"Слоты уже известны ({len(available)} дат), ждём новых...")
+                    else:
+                        log.info("Свободных слотов нет.")
+
+                    last_known_dates = set(available)
+
+            hour = datetime.now().hour
+            if DAY_START_HOUR <= hour < DAY_END_HOUR:
+                interval = random.randint(CHECK_INTERVAL_DAY_MIN, CHECK_INTERVAL_DAY_MAX)
+            else:
+                interval = random.randint(CHECK_INTERVAL_MIN, CHECK_INTERVAL_MAX)
             log.info(f"Следующая проверка через {interval} сек")
             await asyncio.sleep(interval)
 
