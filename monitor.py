@@ -130,6 +130,16 @@ TIMES_RETRY_WAIT = int(os.getenv("TIMES_RETRY_WAIT", "3"))
 WORKER_PROXIES = [p.strip() for p in os.getenv("WORKER_PROXIES", "direct").split(",") if p.strip()]
 MIN_STEP_SECONDS = int(os.getenv("MIN_STEP_SECONDS", "10"))  # нижняя граница шага цикла
 
+# Раз во сколько проверок слать в Telegram полный список дат как heartbeat.
+# С ротацией по каналам проверок стало кратно больше, и на 100 сводки шли слишком часто.
+REPORT_EVERY = int(os.getenv("REPORT_EVERY", "500"))
+
+# Минимальный запас по времени до даты собеседования: на окно «завтра» физически
+# не успеть доехать, поэтому такие даты автобронь пропускает, даже если они попадают
+# в AUTOBOOK_RANGES. Границы диапазонов заданы абсолютными датами, и когда сегодняшнее
+# число войдёт внутрь диапазона, без этого фильтра кандидатом стал бы и завтрашний день.
+AUTOBOOK_MIN_LEAD_DAYS = int(os.getenv("AUTOBOOK_MIN_LEAD_DAYS", "2"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -729,15 +739,18 @@ async def main():
                 f"{booked_state.get('date')} {booked_state.get('time')}"
             )
         elif AUTOBOOK_ENABLED:
-            today = datetime.now().date()
+            today = datetime.now(ASTANA_TZ).date()
             preview = "; ".join(
                 f"{resolve_date(a, today)}…{resolve_date(b, today)}"
                 for a, b in autobook_ranges
             ) or "(пусто)"
-            log.info(f"Autobook включён, dry-run={AUTOBOOK_DRY_RUN}, диапазоны: {preview}")
+            log.info(
+                f"Autobook включён, dry-run={AUTOBOOK_DRY_RUN}, "
+                f"мин. запас {AUTOBOOK_MIN_LEAD_DAYS} дн., диапазоны: {preview}"
+            )
             autobook_status = (
                 f"\n🤖 Autobook: <b>{'DRY-RUN' if AUTOBOOK_DRY_RUN else 'LIVE'}</b>, "
-                f"диапазоны: {preview}"
+                f"не ближе {AUTOBOOK_MIN_LEAD_DAYS} дн., диапазоны: {preview}"
             )
         else:
             autobook_status = ""
@@ -764,7 +777,7 @@ async def main():
                 f"[#{check_count}] {datetime.now().strftime('%H:%M:%S')} — проверяю ({spec})..."
             )
 
-            is_periodic_report = check_count % 100 == 0
+            is_periodic_report = check_count % REPORT_EVERY == 0
 
             # MAX_DATE фильтруется локально, поэтому берём полный список одним запросом
             # и уже из него получаем отфильтрованный для основной логики.
@@ -797,12 +810,29 @@ async def main():
                 # пуст. Ёмкость может вернуться в любой момент (чужая отмена), а «новой»
                 # такая дата больше никогда не станет.
                 if autobook_ranges:
-                    today = datetime.now().date()
+                    today = datetime.now(ASTANA_TZ).date()
+                    # ISO-даты сравниваются как строки, поэтому границу держим строкой
+                    min_lead = (today + timedelta(days=AUTOBOOK_MIN_LEAD_DAYS)).isoformat()
                     autobook_pending &= set(available)  # выпавшие из календаря забываем
-                    candidates = sorted(
-                        {d for d in new_dates if date_in_autobook_ranges(d, autobook_ranges, today)}
-                        | autobook_pending
-                    )
+
+                    # Дата, до которой уже не успеть доехать, годной со временем не станет —
+                    # убираем её из очереди совсем, чтобы не перебирать каждую итерацию.
+                    stale = {d for d in autobook_pending if d < min_lead}
+                    if stale:
+                        log.info(
+                            f"AUTOBOOK: снимаю с перепроверки {', '.join(sorted(stale))} — "
+                            f"ближе чем {AUTOBOOK_MIN_LEAD_DAYS} дн."
+                        )
+                        autobook_pending -= stale
+
+                    fresh = {d for d in new_dates if date_in_autobook_ranges(d, autobook_ranges, today)}
+                    too_soon = {d for d in fresh if d < min_lead}
+                    if too_soon:
+                        log.info(
+                            f"AUTOBOOK: {', '.join(sorted(too_soon))} в диапазоне, но раньше "
+                            f"{min_lead} (запас {AUTOBOOK_MIN_LEAD_DAYS} дн.) — не бронирую"
+                        )
+                    candidates = sorted((fresh - too_soon) | autobook_pending)
                     for date in candidates:
                         times_cache[date] = await fetch_times_for_date(client, cookies, date)
                         if not times_cache[date]:
