@@ -6,6 +6,7 @@ US Visa Slot Monitor — Посольство США в Астане
 """
 
 import asyncio
+import contextlib
 import html
 import json
 import logging
@@ -106,6 +107,28 @@ DAYS_URL    = f"{BASE_URL}/schedule/{SCHEDULE_ID}/appointment/days/134.json?appo
 TIMES_URL   = f"{BASE_URL}/schedule/{SCHEDULE_ID}/appointment/times/134.json?date={{date}}&appointments[expedite]=false"
 BOOKING_URL = f"{BASE_URL}/schedule/{SCHEDULE_ID}/appointment"
 BOOKED_FILE = "booked.json"
+BROWSER_UA  = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+
+# Сколько раз повторить запрос при 5xx/сетевом сбое, прежде чем пропустить итерацию.
+# Раньше ретрай был один и каждый 502 стоил целой проверки (≈30 мин слепоты в сутки).
+TRANSIENT_RETRIES = int(os.getenv("TRANSIENT_RETRIES", "3"))
+TRANSIENT_BACKOFF = (2, 4, 7)  # базовая пауза по номеру попытки, сверху джиттер 0-2с
+
+# Прогрев формы бронирования: сколько секунд считать разобранную форму актуальной
+FORM_CACHE_TTL = int(os.getenv("FORM_CACHE_TTL", "600"))
+
+# times.json умеет возвращать пустой список на дату, которую days.json уже показывает
+# (разные кеши на стороне сайта) — поэтому пустой ответ переспрашиваем
+TIMES_RETRIES    = int(os.getenv("TIMES_RETRIES", "2"))
+TIMES_RETRY_WAIT = int(os.getenv("TIMES_RETRY_WAIT", "3"))
+
+# Выходные каналы: проверки идут по кругу через разные внешние IP (SOCKS-туннели),
+# поэтому каждый адрес сохраняет прежний спокойный ритм, а суммарная частота растёт
+# кратно их числу. "direct" — без прокси, с самого VPS. Сессия к IP не привязана,
+# поэтому куки у всех каналов общие.
+WORKER_PROXIES = [p.strip() for p in os.getenv("WORKER_PROXIES", "direct").split(",") if p.strip()]
+MIN_STEP_SECONDS = int(os.getenv("MIN_STEP_SECONDS", "10"))  # нижняя граница шага цикла
 
 logging.basicConfig(
     level=logging.INFO,
@@ -155,11 +178,26 @@ def save_booked(date: str, time: str, status: int, location: str):
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def cookie_header(cookies: dict) -> str:
+    """Cookie-строка без служебного ключа _csrf_token (он уходит в заголовок)."""
+    return "; ".join(f"{k}={v}" for k, v in cookies.items() if k != "_csrf_token")
+
+
+def booking_page_headers(cookies: dict) -> dict:
+    """Заголовки для HTML-страницы бронирования (не XHR, поэтому Accept: text/html)."""
+    return {
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
+        "Cookie": cookie_header(cookies),
+    }
+
+
 def build_headers(cookies: dict) -> dict:
-    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items() if k != "_csrf_token")
+    cookie_str = cookie_header(cookies)
     csrf = cookies.get("_csrf_token", "")
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "User-Agent": BROWSER_UA,
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
         "Referer": BOOKING_URL,
@@ -261,22 +299,36 @@ async def do_login(client: httpx.AsyncClient) -> dict:
 
 async def fetch_available_days(client, cookies, bot, max_date: str = MAX_DATE):
     """Возвращает (dates, cookies). dates=None означает ошибку (а не пустой календарь)."""
-    for attempt in range(2):
+    transient = 0     # израсходованные ретраи на 5xx/сетевых сбоях
+    relogged = False  # автологин в рамках одного вызова делаем максимум один раз
+
+    def transient_wait() -> int:
+        base = TRANSIENT_BACKOFF[min(transient, len(TRANSIENT_BACKOFF) - 1)]
+        return base + random.randint(0, 2)
+
+    while True:
         try:
             resp = await client.get(DAYS_URL, headers=build_headers(cookies), timeout=30, follow_redirects=False)
         except (httpx.TimeoutException, httpx.TransportError) as e:
-            if attempt == 0:
-                wait = random.randint(5, 10)
-                log.warning(f"Сетевой сбой ({type(e).__name__}), ретрай через {wait}с")
+            if transient < TRANSIENT_RETRIES:
+                wait = transient_wait()
+                transient += 1
+                log.warning(
+                    f"Сетевой сбой ({type(e).__name__}), ретрай {transient}/{TRANSIENT_RETRIES} через {wait}с"
+                )
                 await asyncio.sleep(wait)
                 continue
-            log.error(f"Сетевая ошибка после ретрая: {e}")
+            log.error(f"Сетевая ошибка после {transient} ретраев: {e}")
             return None, cookies
         except Exception as e:
             log.error(f"Ошибка при запросе дней: {e}")
             return None, cookies
 
         if resp.status_code in (401, 302):
+            if relogged:
+                log.error("Сессия слетела повторно в рамках одной проверки, пропускаю итерацию")
+                return None, cookies
+            relogged = True
             log.warning("Сессия устарела, выполняю автологин...")
             await send_telegram(bot, "🔄 Сессия устарела, выполняю автологин...")
             new_cookies = await do_login(client)
@@ -285,6 +337,7 @@ async def fetch_available_days(client, cookies, bot, max_date: str = MAX_DATE):
                 return None, cookies
             await send_telegram(bot, "✅ Автологин успешен, сессия восстановлена")
             cookies = new_cookies
+            invalidate_form_cache("сменилась сессия")
             continue  # повторяем запрос с новыми куками
 
         if resp.status_code == 429:
@@ -302,12 +355,13 @@ async def fetch_available_days(client, cookies, bot, max_date: str = MAX_DATE):
             return None, cookies
 
         if 500 <= resp.status_code < 600:
-            if attempt == 0:
-                wait = random.randint(5, 10)
-                log.warning(f"HTTP {resp.status_code}, ретрай через {wait}с")
+            if transient < TRANSIENT_RETRIES:
+                wait = transient_wait()
+                transient += 1
+                log.warning(f"HTTP {resp.status_code}, ретрай {transient}/{TRANSIENT_RETRIES} через {wait}с")
                 await asyncio.sleep(wait)
                 continue
-            log.error(f"HTTP {resp.status_code} после ретрая")
+            log.error(f"HTTP {resp.status_code} после {transient} ретраев")
             return None, cookies
 
         if resp.status_code != 200:
@@ -332,18 +386,26 @@ async def fetch_available_days(client, cookies, bot, max_date: str = MAX_DATE):
     return None, cookies
 
 
-async def fetch_times_for_date(client, cookies, date):
-    try:
-        resp = await client.get(TIMES_URL.format(date=date), headers=build_headers(cookies), timeout=30)
-        if resp.status_code == 429:
-            pause = note_rate_limit()
-            log.warning(f"HTTP 429 при запросе времён для {date}. Пауза {pause} сек после текущей итерации.")
+async def fetch_times_for_date(client, cookies, date, retries: int = TIMES_RETRIES):
+    """Времена на дату. Пустой ответ повторяем: days.json бывает свежее кеша times.json."""
+    for attempt in range(retries + 1):
+        try:
+            resp = await client.get(TIMES_URL.format(date=date), headers=build_headers(cookies), timeout=30)
+            if resp.status_code == 429:
+                pause = note_rate_limit()
+                log.warning(f"HTTP 429 при запросе времён для {date}. Пауза {pause} сек после текущей итерации.")
+                return []
+            resp.raise_for_status()
+            times = resp.json().get("available_times", [])
+        except Exception as e:
+            log.error(f"Ошибка при запросе времён для {date}: {e}")
             return []
-        resp.raise_for_status()
-        return resp.json().get("available_times", [])
-    except Exception as e:
-        log.error(f"Ошибка при запросе времён для {date}: {e}")
-        return []
+
+        if times or attempt == retries:
+            return times
+        log.info(f"times.json для {date} пуст, повтор {attempt + 1}/{retries} через {TIMES_RETRY_WAIT}с")
+        await asyncio.sleep(TIMES_RETRY_WAIT)
+    return []
 
 
 async def send_telegram(bot: Bot, message: str):
@@ -431,65 +493,133 @@ def parse_booking_form(page_html: str) -> tuple[str, dict[str, str]]:
     return action, fields
 
 
-async def do_real_booking(client, cookies: dict, date: str, time: str) -> tuple[bool, int, str]:
-    """Реальный POST на бронирование. Возвращает (success, status_code, message)."""
-    UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items() if k != "_csrf_token")
-    page_headers = {
-        "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
-        "Cookie": cookie_str,
-    }
-    log.info(f"AUTOBOOK: GET формы для {date} {time}")
-    try:
-        page = await client.get(BOOKING_URL, headers=page_headers, timeout=30)
-    except Exception as e:
-        return False, 0, f"GET формы упал: {e}"
-    if page.status_code != 200:
-        return False, page.status_code, f"GET формы вернул {page.status_code}"
+# Прогретая форма бронирования: {"action", "fields", "cookie_sig", "at"}.
+# Позволяет при находке слота слать POST сразу, без GET страницы (экономит ~1-1.5с).
+_form_cache: dict | None = None
 
+
+def invalidate_form_cache(reason: str = ""):
+    global _form_cache
+    if _form_cache is not None:
+        _form_cache = None
+        log.info(f"Кеш формы брони сброшен{': ' + reason if reason else ''}")
+
+
+def get_cached_form(cookies: dict):
+    """Возвращает (action, fields) из кеша, либо None если кеша нет/протух/сессия сменилась."""
+    if not _form_cache:
+        return None
+    if _form_cache["cookie_sig"] != cookie_header(cookies):
+        return None
+    if (datetime.now() - _form_cache["at"]).total_seconds() > FORM_CACHE_TTL:
+        return None
+    return _form_cache["action"], dict(_form_cache["fields"])
+
+
+async def fetch_booking_form(client, cookies: dict) -> tuple[str, dict]:
+    """GET страницы брони + разбор формы, результат кладётся в кеш. RuntimeError при неудаче."""
+    global _form_cache
+    try:
+        page = await client.get(BOOKING_URL, headers=booking_page_headers(cookies), timeout=30)
+    except Exception as e:
+        raise RuntimeError(f"GET формы упал: {e}") from e
+    if page.status_code != 200:
+        raise RuntimeError(f"GET формы вернул {page.status_code}")
     try:
         action, fields = parse_booking_form(page.text)
     except ValueError as e:
         snippet = page.text[:300].replace("\n", " ")
-        return False, page.status_code, f"{e}. HTML начало: {snippet}"
-
-    fields["appointments[consulate_appointment][facility_id]"] = "134"
-    fields["appointments[consulate_appointment][date]"] = date
-    fields["appointments[consulate_appointment][time]"] = time
-    fields.setdefault("utf8", "✓")
-    fields.setdefault("confirmed_limit_message", "1")
-    fields.setdefault("use_consulate_appointment_capacity", "true")
-
-    auth_token = fields.get("authenticity_token", "")
-    log.info(f"AUTOBOOK: POST {action}, полей={len(fields)}, csrf={'есть' if auth_token else 'НЕТ'}")
-
-    post_headers = {
-        **page_headers,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://ais.usvisa-info.com",
-        "Referer": BOOKING_URL,
-        "X-CSRF-Token": auth_token,
+        raise RuntimeError(f"{e}. HTML начало: {snippet}") from e
+    _form_cache = {
+        "action": action,
+        "fields": fields,
+        "cookie_sig": cookie_header(cookies),
+        "at": datetime.now(),
     }
+    return action, dict(fields)
+
+
+async def warm_booking_form(client, cookies: dict):
+    """Фоновый прогрев: обновляет кеш формы, если он протух. Ошибки не фатальны."""
+    if get_cached_form(cookies):
+        return
     try:
-        resp = await client.post(action, headers=post_headers, data=fields, timeout=30, follow_redirects=False)
-    except Exception as e:
-        return False, 0, f"POST упал: {e}"
+        _, fields = await fetch_booking_form(client, cookies)
+        log.info(
+            f"Прогрев формы брони: ок, полей={len(fields)}, "
+            f"csrf={'есть' if fields.get('authenticity_token') else 'НЕТ'}"
+        )
+    except RuntimeError as e:
+        log.warning(f"Прогрев формы брони не удался: {e}")
 
-    location = resp.headers.get("location", "")
-    log.info(f"AUTOBOOK: POST статус={resp.status_code}, location={location}")
 
-    # Успех: 302 на следующий шаг (insurance/confirmation), не назад на форму бронирования
-    if resp.status_code in (302, 303) and location:
-        if "/appointment/days" in location or location.endswith("/appointment"):
-            return False, resp.status_code, f"302 назад на форму ({location}) — бронь не прошла"
-        return True, resp.status_code, location
-    if resp.status_code == 200:
-        snippet = resp.text[:400].replace("\n", " ")
-        return False, 200, f"200 (форма перерисована, ошибка валидации). Тело: {snippet}"
-    snippet = resp.text[:200].replace("\n", " ") if resp.text else ""
-    return False, resp.status_code, f"HTTP {resp.status_code}. Location={location or '-'}. Тело: {snippet}"
+async def do_real_booking(client, cookies: dict, date: str, time: str) -> tuple[bool, int, str]:
+    """Реальный POST на бронирование. Возвращает (success, status_code, message)."""
+    page_headers = booking_page_headers(cookies)
+    last_status, last_msg = 0, "попытка брони не выполнена"
+
+    # Попытка 0 — с прогретой формой (если есть), попытка 1 — со свежей после сброса кеша
+    for attempt in range(2):
+        cached = get_cached_form(cookies) if attempt == 0 else None
+        if cached:
+            action, fields = cached
+            log.info(f"AUTOBOOK: форма из прогретого кеша для {date} {time}")
+        else:
+            log.info(f"AUTOBOOK: GET формы для {date} {time}")
+            try:
+                action, fields = await fetch_booking_form(client, cookies)
+            except RuntimeError as e:
+                return False, last_status, str(e)
+
+        fields["appointments[consulate_appointment][facility_id]"] = "134"
+        fields["appointments[consulate_appointment][date]"] = date
+        fields["appointments[consulate_appointment][time]"] = time
+        fields.setdefault("utf8", "✓")
+        fields.setdefault("confirmed_limit_message", "1")
+        fields.setdefault("use_consulate_appointment_capacity", "true")
+
+        auth_token = fields.get("authenticity_token", "")
+        log.info(
+            f"AUTOBOOK: POST {action}, полей={len(fields)}, "
+            f"csrf={'есть' if auth_token else 'НЕТ'}, форма={'кеш' if cached else 'свежая'}"
+        )
+
+        post_headers = {
+            **page_headers,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://ais.usvisa-info.com",
+            "Referer": BOOKING_URL,
+            "X-CSRF-Token": auth_token,
+        }
+        try:
+            resp = await client.post(action, headers=post_headers, data=fields, timeout=30, follow_redirects=False)
+        except Exception as e:
+            return False, 0, f"POST упал: {e}"
+
+        location = resp.headers.get("location", "")
+        log.info(f"AUTOBOOK: POST статус={resp.status_code}, location={location}")
+
+        # Успех: 302 на следующий шаг (insurance/confirmation), не назад на форму бронирования
+        if resp.status_code in (302, 303) and location:
+            if "/appointment/days" in location or location.endswith("/appointment"):
+                last_msg = f"302 назад на форму ({location}) — бронь не прошла"
+            else:
+                return True, resp.status_code, location
+        elif resp.status_code == 200:
+            snippet = resp.text[:400].replace("\n", " ")
+            last_msg = f"200 (форма перерисована, ошибка валидации). Тело: {snippet}"
+        else:
+            snippet = resp.text[:200].replace("\n", " ") if resp.text else ""
+            last_msg = f"HTTP {resp.status_code}. Location={location or '-'}. Тело: {snippet}"
+        last_status = resp.status_code
+
+        # Кешированная форма могла протухнуть (CSRF/скрытые поля) — один повтор со свежей
+        if cached:
+            invalidate_form_cache("POST не прошёл, повторяю со свежей формой")
+            continue
+        return False, last_status, last_msg
+
+    return False, last_status, last_msg
 
 
 async def try_autobook(client, cookies: dict, bot, date: str, time: str) -> bool:
@@ -559,7 +689,24 @@ async def main():
 
     bot = Bot(token=TELEGRAM_TOKEN)
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    async with contextlib.AsyncExitStack() as stack:
+        channels = []
+        for spec in WORKER_PROXIES:
+            proxy = None if spec.lower() in ("direct", "none", "-") else spec
+            try:
+                client = await stack.enter_async_context(
+                    httpx.AsyncClient(follow_redirects=True, proxy=proxy)
+                )
+            except Exception as e:
+                log.error(f"Канал {spec} не поднялся ({e}), пропускаю")
+                continue
+            channels.append((spec, client))
+        if not channels:
+            log.error("Ни один выходной канал не доступен — проверьте WORKER_PROXIES")
+            return
+        log.info("Выходные каналы: %s", ", ".join(spec for spec, _ in channels))
+
+        client = channels[0][1]  # для стартового логина
         cookies = load_cookies()
         if not cookies:
             log.info("Cookies не найдены, пробую автологин...")
@@ -604,6 +751,7 @@ async def main():
         )
 
         last_known_dates: set = set()
+        autobook_pending: set = set()  # даты в диапазоне, ждущие появления времён
         last_all_count = -1          # -1 => первая успешная проверка всегда шлёт полный список
         check_count = 0
         consecutive_errors = 0
@@ -611,7 +759,10 @@ async def main():
 
         while True:
             check_count += 1
-            log.info(f"[#{check_count}] {datetime.now().strftime('%H:%M:%S')} — проверяю...")
+            spec, client = channels[(check_count - 1) % len(channels)]
+            log.info(
+                f"[#{check_count}] {datetime.now().strftime('%H:%M:%S')} — проверяю ({spec})..."
+            )
 
             is_periodic_report = check_count % 100 == 0
 
@@ -639,30 +790,43 @@ async def main():
                 consecutive_errors = 0
 
                 new_dates = set(available) - last_known_dates
+                times_cache: dict[str, list[str]] = {}
+
+                # Автобронь идёт независимо от уведомлений: кроме новых дат в диапазоне
+                # проверяем отложенные — те, что в календаре есть, но times.json на них был
+                # пуст. Ёмкость может вернуться в любой момент (чужая отмена), а «новой»
+                # такая дата больше никогда не станет.
+                if autobook_ranges:
+                    today = datetime.now().date()
+                    autobook_pending &= set(available)  # выпавшие из календаря забываем
+                    candidates = sorted(
+                        {d for d in new_dates if date_in_autobook_ranges(d, autobook_ranges, today)}
+                        | autobook_pending
+                    )
+                    for date in candidates:
+                        times_cache[date] = await fetch_times_for_date(client, cookies, date)
+                        if not times_cache[date]:
+                            if date not in autobook_pending:
+                                log.warning(
+                                    f"AUTOBOOK: дата {date} в диапазоне, но слотов нет — "
+                                    "беру на перепроверку"
+                                )
+                            autobook_pending.add(date)
+                            continue
+                        if date in autobook_pending:
+                            log.info(f"AUTOBOOK: на отложенной дате {date} появились времена")
+                            autobook_pending.discard(date)
+                        booked = await try_autobook(client, cookies, bot, date, times_cache[date][0])
+                        if booked:
+                            autobook_ranges = []
+                            autobook_pending.clear()
+                            log.info("AUTOBOOK: бронь успешна, дальнейшие попытки отключены")
+                            break
 
                 if new_dates:
-                    times_cache: dict[str, list[str]] = {}
-
-                    if autobook_ranges:
-                        today = datetime.now().date()
-                        candidates = sorted(
-                            d for d in new_dates
-                            if date_in_autobook_ranges(d, autobook_ranges, today)
-                        )
-                        for date in candidates:
-                            times_cache[date] = await fetch_times_for_date(client, cookies, date)
-                            if not times_cache[date]:
-                                log.warning(f"AUTOBOOK: дата {date} в диапазоне, но слотов нет")
-                                continue
-                            booked = await try_autobook(client, cookies, bot, date, times_cache[date][0])
-                            if booked:
-                                autobook_ranges = []
-                                log.info("AUTOBOOK: бронь успешна, дальнейшие попытки отключены")
-                                break
-
                     details = []
                     for date in sorted(new_dates)[:3]:
-                        times = times_cache.get(date) or await fetch_times_for_date(client, cookies, date)
+                        times = times_cache.get(date) or await fetch_times_for_date(client, cookies, date, retries=0)
                         time_str = ", ".join(times[:5]) if times else "нет данных"
                         if len(times) > 5:
                             time_str += f" (+{len(times)-5} ещё)"
@@ -726,6 +890,11 @@ async def main():
 
                 last_all_count = len(all_dates)
 
+                # Держим форму брони разобранной заранее: при находке слота POST уйдёт
+                # сразу, без GET страницы. Актуально только для живого автобронирования.
+                if autobook_ranges and not AUTOBOOK_DRY_RUN:
+                    await warm_booking_form(client, cookies)
+
             backoff = take_backoff()
             if backoff:
                 log.warning(f"Backoff после 429: следующая проверка через {backoff} сек")
@@ -733,8 +902,14 @@ async def main():
                 continue
 
             label, interval = pick_interval()
-            log.info(f"Следующая проверка через {interval} сек ({label}, Астана)")
-            await asyncio.sleep(interval)
+            # interval — ритм ОДНОГО выхода; шаг общего цикла во столько же раз короче,
+            # сколько у нас выходных каналов
+            step = max(MIN_STEP_SECONDS, round(interval / len(channels)))
+            log.info(
+                f"Следующая проверка через {step} сек ({label}, Астана; "
+                f"на канал раз в ~{interval}с, каналов {len(channels)})"
+            )
+            await asyncio.sleep(step)
 
 
 if __name__ == "__main__":

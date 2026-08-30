@@ -6,3 +6,11 @@ monitor.log
 monitor.out
 monitor.err
 bot.pid
+monitor.py.bak.*
+.env.bak.*
+.claude/settings.local.json
+tunnel.log
+tunnel.out
+tunnel.err
+tunnel.pid
+booked.json
