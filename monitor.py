@@ -13,6 +13,8 @@ import logging
 import os
 import random
 import re
+import socket
+import time
 from datetime import datetime, timedelta, timezone, date as date_cls
 
 import httpx
@@ -130,6 +132,19 @@ TIMES_RETRY_WAIT = int(os.getenv("TIMES_RETRY_WAIT", "3"))
 WORKER_PROXIES = [p.strip() for p in os.getenv("WORKER_PROXIES", "direct").split(",") if p.strip()]
 MIN_STEP_SECONDS = int(os.getenv("MIN_STEP_SECONDS", "10"))  # нижняя граница шага цикла
 
+# Сайт живёт на нескольких EC2-адресах (us-gov-east-1), и часть из них периодически
+# отдаёт RST на 443. 07.09.2026 из трёх A-записей рабочей была одна: 18.254.10.38 лежал
+# отовсюду, 18.252.251.101 — с VPS и zeus. Обычный резолв берёт адрес наугад и мёртвый
+# не отбраковывает (а SOCKS вообще резолвит имя на выходном хосте и перебора не делает),
+# поэтому до половины проверок падало в ConnectError. Адрес выбираем сами: держим пул
+# A-записей, отказавшие уводим в карантин, Host и SNI при этом остаются исходными.
+TARGET_HOST   = "ais.usvisa-info.com"
+PIN_TARGET_IP = os.getenv("PIN_TARGET_IP", "true").lower() in ("1", "true", "yes")
+DNS_REFRESH   = int(os.getenv("DNS_REFRESH", "300"))    # как часто перечитывать A-записи
+DNS_RETRY     = 30                                       # пауза до повтора, если резолв упал
+IP_QUARANTINE = int(os.getenv("IP_QUARANTINE", "180"))  # карантин адреса после отказа, сек
+IP_ATTEMPTS   = int(os.getenv("IP_ATTEMPTS", "3"))      # сколько адресов пробовать за запрос
+
 # Раз во сколько проверок слать в Telegram полный список дат как heartbeat.
 # С ротацией по каналам проверок стало кратно больше, и на 100 сводки шли слишком часто.
 REPORT_EVERY = int(os.getenv("REPORT_EVERY", "500"))
@@ -149,6 +164,114 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+
+# --- Выбор живого адреса цели -------------------------------------------------
+
+_dns_pool: list = []          # текущие A-записи TARGET_HOST
+_dns_fetched_at = 0.0         # monotonic-время последнего резолва
+_ip_quarantine: dict = {}     # ip -> monotonic-время, до которого адрес не трогаем
+_ip_sticky = None             # последний удачный адрес: держимся за него ради keep-alive
+
+
+async def resolve_target() -> list:
+    """A-записи TARGET_HOST с кешем на DNS_REFRESH секунд. [] — резолва нет вообще."""
+    global _dns_pool, _dns_fetched_at
+    now = time.monotonic()
+    if _dns_pool and now - _dns_fetched_at < DNS_REFRESH:
+        return _dns_pool
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(
+            TARGET_HOST, 443, family=socket.AF_INET, type=socket.SOCK_STREAM
+        )
+    except OSError as e:
+        # Не сбрасываем пул: старые адреса лучше, чем ничего. Повтор через DNS_RETRY.
+        _dns_fetched_at = now - max(0, DNS_REFRESH - DNS_RETRY)
+        log.warning(f"DNS: не удалось резолвить {TARGET_HOST}: {e}")
+        return _dns_pool
+    ips = sorted({info[4][0] for info in infos})
+    if ips != _dns_pool:
+        log.info("DNS: адреса %s → %s", TARGET_HOST, ", ".join(ips) or "пусто")
+        for gone in [ip for ip in _ip_quarantine if ip not in ips]:
+            _ip_quarantine.pop(gone, None)
+    _dns_pool, _dns_fetched_at = ips, now
+    return ips
+
+
+def pick_target_ip(pool: list, exclude: list):
+    """Живой адрес из пула. None — пробовать больше нечего."""
+    now = time.monotonic()
+    candidates = [ip for ip in pool if ip not in exclude]
+    fresh = [ip for ip in candidates if _ip_quarantine.get(ip, 0) <= now]
+    if not fresh and candidates:
+        # Все в карантине — снимаем его: лучше стучаться наугад, чем ослепнуть совсем.
+        log.warning("Все адреса %s в карантине, снимаю и пробую заново", TARGET_HOST)
+        for ip in candidates:
+            _ip_quarantine.pop(ip, None)
+        fresh = candidates
+    if not fresh:
+        return None
+    if _ip_sticky in fresh:
+        return _ip_sticky
+    return random.choice(fresh)
+
+
+def mark_ip_bad(ip: str, exc: Exception):
+    global _ip_sticky
+    if _ip_quarantine.get(ip, 0) <= time.monotonic():
+        log.warning(f"Адрес {ip} не пускает ({type(exc).__name__}), карантин {IP_QUARANTINE}с")
+    _ip_quarantine[ip] = time.monotonic() + IP_QUARANTINE
+    if _ip_sticky == ip:
+        _ip_sticky = None
+
+
+def mark_ip_good(ip: str):
+    global _ip_sticky
+    if _ip_quarantine.pop(ip, None) is not None:
+        log.info(f"Адрес {ip} снова отвечает")
+    _ip_sticky = ip
+
+
+class PinnedHostTransport(httpx.AsyncHTTPTransport):
+    """Транспорт, который сам выбирает IP цели и обходит мёртвые A-записи.
+
+    Подменяется только адрес подключения: Host-заголовок httpx проставил при сборке
+    запроса, SNI передаём через extensions, так что сервер видит обычный запрос к
+    ais.usvisa-info.com. Повтор делается исключительно на ошибках установки соединения —
+    в этот момент ни байта тела ещё не ушло, поэтому POST брони повториться не может.
+    """
+
+    async def handle_async_request(self, request):
+        if not PIN_TARGET_IP or request.url.host != TARGET_HOST:
+            return await super().handle_async_request(request)
+
+        pool = await resolve_target()
+        if not pool:
+            return await super().handle_async_request(request)
+
+        original_url = request.url
+        tried, last_exc = [], None
+        for _ in range(max(1, IP_ATTEMPTS)):
+            ip = pick_target_ip(pool, tried)
+            if ip is None:
+                break
+            tried.append(ip)
+            request.url = original_url.copy_with(host=ip)
+            request.extensions = {**request.extensions, "sni_hostname": TARGET_HOST}
+            try:
+                response = await super().handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                last_exc = e
+                mark_ip_bad(ip, e)
+            else:
+                mark_ip_good(ip)
+                return response
+            finally:
+                request.url = original_url  # дальше по стеку httpx ждёт исходный URL
+        if last_exc is not None:
+            raise last_exc
+        return await super().handle_async_request(request)
 
 
 def save_cookies(cookies: dict):
@@ -705,7 +828,10 @@ async def main():
             proxy = None if spec.lower() in ("direct", "none", "-") else spec
             try:
                 client = await stack.enter_async_context(
-                    httpx.AsyncClient(follow_redirects=True, proxy=proxy)
+                    httpx.AsyncClient(
+                        follow_redirects=True,
+                        transport=PinnedHostTransport(proxy=proxy),
+                    )
                 )
             except Exception as e:
                 log.error(f"Канал {spec} не поднялся ({e}), пропускаю")
