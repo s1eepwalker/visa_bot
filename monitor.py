@@ -171,10 +171,20 @@ log = logging.getLogger(__name__)
 
 # --- Выбор живого адреса цели -------------------------------------------------
 
-_dns_pool: list = []          # текущие A-записи TARGET_HOST
+_dns_pool: list = []          # текущие A-записи TARGET_HOST (общие для всех каналов)
 _dns_fetched_at = 0.0         # monotonic-время последнего резолва
-_ip_quarantine: dict = {}     # ip -> monotonic-время, до которого адрес не трогаем
-_ip_sticky = None             # последний удачный адрес: держимся за него ради keep-alive
+
+# Отказ на уровне SOCKS прилетает как socksio.exceptions.ProtocolError («Malformed reply»),
+# и это НЕ наследник httpx.TransportError — без явного перехвата он пролетает мимо всех
+# обработчиков. Возникает только на этапе рукопожатия SOCKS, то есть до отправки тела,
+# поэтому повторять на нём так же безопасно, как на ошибке соединения.
+try:
+    from socksio.exceptions import ProtocolError as _SocksProtocolError
+    _SOCKS_ERRORS = (_SocksProtocolError,)
+except ImportError:
+    _SOCKS_ERRORS = ()
+
+CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) + _SOCKS_ERRORS
 
 
 async def resolve_target() -> list:
@@ -195,55 +205,63 @@ async def resolve_target() -> list:
         return _dns_pool
     ips = sorted({info[4][0] for info in infos})
     if ips != _dns_pool:
+        # Карантин исчезнувших адресов не чистим: он живёт в транспортах, а записи
+        # всё равно истекают через IP_QUARANTINE и на выбор из нового пула не влияют.
         log.info("DNS: адреса %s → %s", TARGET_HOST, ", ".join(ips) or "пусто")
-        for gone in [ip for ip in _ip_quarantine if ip not in ips]:
-            _ip_quarantine.pop(gone, None)
     _dns_pool, _dns_fetched_at = ips, now
     return ips
 
 
-def pick_target_ip(pool: list, exclude: list):
-    """Живой адрес из пула. None — пробовать больше нечего."""
-    now = time.monotonic()
-    candidates = [ip for ip in pool if ip not in exclude]
-    fresh = [ip for ip in candidates if _ip_quarantine.get(ip, 0) <= now]
-    if not fresh and candidates:
-        # Все в карантине — снимаем его: лучше стучаться наугад, чем ослепнуть совсем.
-        log.warning("Все адреса %s в карантине, снимаю и пробую заново", TARGET_HOST)
-        for ip in candidates:
-            _ip_quarantine.pop(ip, None)
-        fresh = candidates
-    if not fresh:
-        return None
-    if _ip_sticky in fresh:
-        return _ip_sticky
-    return random.choice(fresh)
-
-
-def mark_ip_bad(ip: str, exc: Exception):
-    global _ip_sticky
-    if _ip_quarantine.get(ip, 0) <= time.monotonic():
-        log.warning(f"Адрес {ip} не пускает ({type(exc).__name__}), карантин {IP_QUARANTINE}с")
-    _ip_quarantine[ip] = time.monotonic() + IP_QUARANTINE
-    if _ip_sticky == ip:
-        _ip_sticky = None
-
-
-def mark_ip_good(ip: str):
-    global _ip_sticky
-    if _ip_quarantine.pop(ip, None) is not None:
-        log.info(f"Адрес {ip} снова отвечает")
-    _ip_sticky = ip
-
-
 class PinnedHostTransport(httpx.AsyncHTTPTransport):
-    """Транспорт, который сам выбирает IP цели и обходит мёртвые A-записи.
+    """Транспорт, который сам выбирает IP цели и обходит недоступные A-записи.
 
     Подменяется только адрес подключения: Host-заголовок httpx проставил при сборке
     запроса, SNI передаём через extensions, так что сервер видит обычный запрос к
     ais.usvisa-info.com. Повтор делается исключительно на ошибках установки соединения —
     в этот момент ни байта тела ещё не ушло, поэтому POST брони повториться не может.
+
+    Карантин и «липкий» адрес живут в экземпляре, а не в модуле: доступность бэкендов
+    различается от канала к каналу (08.09.2026 hessen дотягивался до всех трёх адресов,
+    а zeus и frank — только до 18.254.13.15). С общим состоянием канал наследовал чужой
+    удачный адрес, до которого сам достучаться не мог, и терял половину проверок.
     """
+
+    def __init__(self, *args, label: str = "", **kwargs):
+        super().__init__(*args, **kwargs)
+        self._label = label            # имя канала, только для логов
+        self._quarantine: dict = {}    # ip -> monotonic-время, до которого не трогаем
+        self._sticky = None            # последний удачный адрес: ради keep-alive
+
+    def _pick_ip(self, pool: list, exclude: list):
+        """Живой адрес из пула для этого канала. None — пробовать больше нечего."""
+        now = time.monotonic()
+        candidates = [ip for ip in pool if ip not in exclude]
+        fresh = [ip for ip in candidates if self._quarantine.get(ip, 0) <= now]
+        if not fresh and candidates:
+            # Все в карантине — снимаем его: лучше стучаться наугад, чем ослепнуть совсем.
+            log.warning("[%s] все адреса %s в карантине, снимаю и пробую заново",
+                        self._label, TARGET_HOST)
+            for ip in candidates:
+                self._quarantine.pop(ip, None)
+            fresh = candidates
+        if not fresh:
+            return None
+        if self._sticky in fresh:
+            return self._sticky
+        return random.choice(fresh)
+
+    def _mark_bad(self, ip: str, exc: Exception):
+        if self._quarantine.get(ip, 0) <= time.monotonic():
+            log.warning(f"[{self._label}] адрес {ip} не пускает ({type(exc).__name__}), "
+                        f"карантин {IP_QUARANTINE}с")
+        self._quarantine[ip] = time.monotonic() + IP_QUARANTINE
+        if self._sticky == ip:
+            self._sticky = None
+
+    def _mark_good(self, ip: str):
+        if self._quarantine.pop(ip, None) is not None:
+            log.info(f"[{self._label}] адрес {ip} снова отвечает")
+        self._sticky = ip
 
     async def handle_async_request(self, request):
         if not PIN_TARGET_IP or request.url.host != TARGET_HOST:
@@ -256,7 +274,7 @@ class PinnedHostTransport(httpx.AsyncHTTPTransport):
         original_url = request.url
         tried, last_exc = [], None
         for _ in range(max(1, IP_ATTEMPTS)):
-            ip = pick_target_ip(pool, tried)
+            ip = self._pick_ip(pool, tried)
             if ip is None:
                 break
             tried.append(ip)
@@ -264,11 +282,11 @@ class PinnedHostTransport(httpx.AsyncHTTPTransport):
             request.extensions = {**request.extensions, "sni_hostname": TARGET_HOST}
             try:
                 response = await super().handle_async_request(request)
-            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            except CONNECT_ERRORS as e:
                 last_exc = e
-                mark_ip_bad(ip, e)
+                self._mark_bad(ip, e)
             else:
-                mark_ip_good(ip)
+                self._mark_good(ip)
                 return response
             finally:
                 request.url = original_url  # дальше по стеку httpx ждёт исходный URL
@@ -445,7 +463,7 @@ async def fetch_available_days(client, cookies, bot, max_date: str = MAX_DATE):
     while True:
         try:
             resp = await client.get(DAYS_URL, headers=build_headers(cookies), timeout=30, follow_redirects=False)
-        except (httpx.TimeoutException, httpx.TransportError) as e:
+        except (httpx.TimeoutException, httpx.TransportError) + _SOCKS_ERRORS as e:
             if transient < TRANSIENT_RETRIES:
                 wait = transient_wait()
                 transient += 1
@@ -833,7 +851,7 @@ async def main():
                 client = await stack.enter_async_context(
                     httpx.AsyncClient(
                         follow_redirects=True,
-                        transport=PinnedHostTransport(proxy=proxy),
+                        transport=PinnedHostTransport(proxy=proxy, label=spec),
                     )
                 )
             except Exception as e:
