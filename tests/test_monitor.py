@@ -1,0 +1,338 @@
+import asyncio
+from datetime import datetime
+from urllib.parse import parse_qsl
+
+import httpx
+import pytest
+
+import monitor
+from monitor import ASTANA_TZ
+
+
+def astana(y, m, d, hh, mm=0):
+    return datetime(y, m, d, hh, mm, tzinfo=ASTANA_TZ)
+
+
+# --- Расписание: по выходным утреннего окна нет ---------------------------------
+
+def test_saturday_morning_uses_day_interval():
+    now = astana(2026, 9, 12, 9)  # суббота
+    label, interval = monitor.pick_interval(now)
+    assert label == "день"
+    assert 45 <= interval <= 48
+
+
+def test_sunday_from_eight_is_day():
+    label, _ = monitor.pick_interval(astana(2026, 9, 13, 8, 5))  # воскресенье
+    assert label == "день"
+
+
+def test_weekday_morning_keeps_morning_interval():
+    label, interval = monitor.pick_interval(astana(2026, 9, 14, 9))  # понедельник
+    assert label == "утро"
+    assert 30 <= interval <= 35
+
+
+def test_weekend_evening_and_night_unchanged():
+    assert monitor.pick_interval(astana(2026, 9, 12, 15))[0] == "вечер"
+    assert monitor.pick_interval(astana(2026, 9, 12, 7))[0] == "ночь"
+
+
+def test_schedule_summary_shows_weekend_separately():
+    summary = monitor.schedule_summary()
+    assert "выходные" in summary
+    assert "день 08:00-12:00" in summary
+
+
+# --- Урезанные копии живых страниц (снято 11.09.2026, личные данные вырезаны) -------
+
+APPT_PATH = "/ru-kz/niv/schedule/72928759/appointment"
+
+
+def limit_warning_page(left: int) -> str:
+    return f"""<html><head><title>Scheduling Limit Warning | Official U.S. Department of State</title></head>
+<body class='appointment new niv'><main id='main'>
+<div class='row subTitle'><h1 class='text'>Scheduling Limit Warning</h1></div>
+<div class='callout secondary animate bounce-in'> <p>Внимание: Максимальное количество разрешенных
+отмен/переносов собеседования на этом сервисе: 3. У вас осталось {left} попыток до достижения этого
+лимита. Имейте ввиду, что если вы достигнете этого лимита, ваше собеседование будет заблокировано.</p> </div>
+<form action="{APPT_PATH}" accept-charset="UTF-8" method="get"> <div class='row'>
+<input type="checkbox" name="confirmed_limit_message" id="confirmed_limit_message" value="1" />
+<label style="display: inline" for="confirmed_limit_message">Я понимаю </label><hr> </div>
+<a class="button secondary" href="/ru-kz/niv/groups/1">Закрыть</a>
+<input type="submit" name="commit" value="Continue" class="button primary" data-disable-with="Continue" />
+</form></main>
+<input type="radio" name="visa_type" id="visa_type_NIV" value="Неиммиграционная виза" checked="checked" />
+</body></html>"""
+
+
+APPLICANTS_PAGE = f"""<html><body><main id='main'>
+<form action="{APPT_PATH}" accept-charset="UTF-8" method="get"> <p> Отметьте всех заявителей,
+которым необходимо перенести собеседование. </p> <p>
+<input type="checkbox" name="applicants[]" id="applicants_" value="1001" checked="checked" /> A <br>
+<input type="checkbox" name="applicants[]" id="applicants_" value="1002" checked="checked" /> B <br>
+<input type="checkbox" name="applicants[]" id="applicants_" value="1003" /> C <br>
+<input type="hidden" name="confirmed_limit_message" id="confirmed_limit_message" value="1" autocomplete="off" />
+</p> <a class="button secondary" href="/ru-kz/niv/groups/1">Закрыть</a>
+<input type="submit" name="commit" value="Продолжить" class="button primary" data-disable-with="Продолжить" />
+</form></main></body></html>"""
+
+
+def booking_form_page(commit: str) -> str:
+    return f"""<html><body><main id='main'>
+<form id="appointment-form" novalidate="novalidate" class="formtastic appointments" action="{APPT_PATH}"
+ accept-charset="UTF-8" method="post"><input type="hidden" name="authenticity_token" value="TOKEN123" autocomplete="off" />
+<input type="hidden" name="confirmed_limit_message" id="confirmed_limit_message" value="1" autocomplete="off" />
+<input type="hidden" name="use_consulate_appointment_capacity" id="use_consulate_appointment_capacity" value="true" autocomplete="off" />
+<select name="appointments[consulate_appointment][facility_id]" id="appointments_consulate_appointment_facility_id">
+<option value="135">Almaty</option> <option selected="selected" value="134">Astana</option></select>
+<input icon="calendar.gif" placeholder="Date" id="appointments_consulate_appointment_date" readonly="readonly"
+ class="required" type="text" name="appointments[consulate_appointment][date]" />
+<select name="appointments[consulate_appointment][time]" id="appointments_consulate_appointment_time"></select>
+<input type="submit" name="commit" value="{commit}" id="appointments_submit" disabled="disabled" />
+</form></main></body></html>"""
+
+
+def groups_page(appt_text: str | None) -> str:
+    if appt_text is None:
+        card = "<div class='card'><h4> Текущий статус <br> Зарегистрировать запись </h4></div>"
+    else:
+        card = (f"<div class='card'> <p class='consular-appt'> <strong>Консульское собеседование"
+                f"<span>&#58;</span></strong> {appt_text} Astana Местное время at Astana &mdash; "
+                f"<a href=\"/ru-kz/niv/schedule/72928759/addresses/consulate\">получить инструкции </a></p> </div>")
+    return f"<html><body><main id='main'>{card}</main></body></html>"
+
+
+# --- Разбор страниц -------------------------------------------------------------
+
+def test_parse_limit_remaining_reads_attempts_left():
+    assert monitor.parse_limit_remaining(limit_warning_page(3)) == 3
+    assert monitor.parse_limit_remaining(limit_warning_page(1)) == 1
+
+
+def test_parse_limit_remaining_none_without_warning():
+    assert monitor.parse_limit_remaining(booking_form_page("Записаться")) is None
+
+
+def test_parse_current_appointment_returns_iso_date():
+    assert monitor.parse_current_appointment(groups_page("14 октябрь, 2027, 09:30")) == "2027-10-14"
+
+
+def test_parse_current_appointment_accepts_genitive_month():
+    assert monitor.parse_current_appointment(groups_page("3 мая, 2027, 10:00")) == "2027-05-03"
+
+
+def test_parse_current_appointment_none_without_appointment():
+    assert monitor.parse_current_appointment(groups_page(None)) is None
+
+
+# --- Мини-сайт на MockTransport -------------------------------------------------
+
+class FakeSite:
+    """Отдаёт страницы как живой сайт и записывает каждый запрос.
+
+    gate=True — запись уже есть: /appointment начинается с предупреждения о лимите,
+    затем выбор заявителей, затем форма «Перезаписаться». gate=False — записи нет,
+    форма «Записаться» лежит сразу на /appointment.
+    """
+
+    def __init__(self, left=3, gate=True, appointment="14 октябрь, 2027, 09:30", first_page=None):
+        self.left, self.gate, self.appointment, self.first_page = left, gate, appointment, first_page
+        self.requests = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        params = parse_qsl(request.url.query.decode())
+        body = parse_qsl(request.content.decode()) if request.method == "POST" else []
+        self.requests.append((request.method, request.url.path, params, body))
+        path, keys = request.url.path, {k for k, _ in params}
+        if path == "/ru-kz/niv/account":
+            return httpx.Response(200, text=groups_page(self.appointment))
+        if path != APPT_PATH:
+            return httpx.Response(404)
+        if request.method == "POST":
+            if self.gate:
+                self.left -= 1  # каждый перенос съедает попытку, как на живом сайте
+            return httpx.Response(302, headers={"location": f"https://ais.usvisa-info.com{APPT_PATH}/instructions"})
+        if not self.gate:
+            return httpx.Response(200, text=booking_form_page("Записаться"))
+        if "applicants[]" in keys:
+            return httpx.Response(200, text=booking_form_page("Перезаписаться"))
+        if "confirmed_limit_message" in keys:
+            return httpx.Response(200, text=APPLICANTS_PAGE)
+        return httpx.Response(200, text=self.first_page or limit_warning_page(self.left))
+
+    def run(self, fn):
+        async def go():
+            transport = httpx.MockTransport(self.handler)
+            async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+                return await fn(client)
+        return asyncio.run(go())
+
+    def posts(self):
+        return [r for r in self.requests if r[0] == "POST" and r[1] == APPT_PATH]
+
+
+@pytest.fixture(autouse=True)
+def clean_state(monkeypatch):
+    monkeypatch.setattr(monitor, "_form_cache", None)
+    monkeypatch.setattr(monitor, "_appointment_date", None, raising=False)
+
+
+# --- Форма брони за предупреждением о лимите ------------------------------------
+
+def test_fetch_booking_form_walks_limit_warning_and_applicants():
+    site = FakeSite(left=3)
+    action, fields, left = site.run(lambda c: monitor.fetch_booking_form(c, {}))
+    assert action == f"https://ais.usvisa-info.com{APPT_PATH}"
+    assert fields["commit"] == "Перезаписаться"
+    assert fields["authenticity_token"] == "TOKEN123"
+    assert left == 3
+    gets = [params for method, _, params, _ in site.requests if method == "GET"]
+    assert ("confirmed_limit_message", "1") in gets[1]
+    assert [v for k, v in gets[2] if k == "applicants[]"] == ["1001", "1002", "1003"]
+
+
+def test_fetch_booking_form_without_appointment_has_no_limit():
+    site = FakeSite(gate=False)
+    _, fields, left = site.run(lambda c: monitor.fetch_booking_form(c, {}))
+    assert fields["commit"] == "Записаться"
+    assert left is None
+    assert len(site.requests) == 1
+
+
+def test_fetch_booking_form_refuses_gate_without_counter():
+    site = FakeSite(first_page=APPLICANTS_PAGE)  # промежуточная страница есть, счётчика нет
+    with pytest.raises(RuntimeError, match="попыт"):
+        site.run(lambda c: monitor.fetch_booking_form(c, {}))
+
+
+# --- Правила переноса -----------------------------------------------------------
+
+def test_refusal_when_reserve_reached():
+    assert monitor.reschedule_refusal("2027-05-10", remaining=2, appointment_date="2027-10-14")
+
+
+def test_refusal_when_date_not_earlier_than_appointment():
+    assert monitor.reschedule_refusal("2027-10-14", remaining=3, appointment_date="2027-10-14")
+    assert monitor.reschedule_refusal("2027-10-20", remaining=3, appointment_date="2027-10-14")
+
+
+def test_refusal_when_appointment_unknown():
+    assert monitor.reschedule_refusal("2027-05-10", remaining=3, appointment_date=None)
+
+
+def test_no_refusal_for_first_booking():
+    assert monitor.reschedule_refusal("2027-05-10", remaining=None, appointment_date=None) == ""
+
+
+def test_no_refusal_for_earlier_date_with_spare_attempts():
+    assert monitor.reschedule_refusal("2027-05-10", remaining=3, appointment_date="2027-10-14") == ""
+
+
+def test_reschedules_exhausted_at_reserve():
+    assert monitor.reschedules_exhausted(2)
+    assert not monitor.reschedules_exhausted(3)
+    assert not monitor.reschedules_exhausted(None)  # записи нет — это первая бронь
+
+
+def test_before_appointment_keeps_only_earlier_dates():
+    dates = {"2027-05-10", "2027-10-14", "2027-10-20"}
+    assert monitor.before_appointment(dates, "2027-10-14") == {"2027-05-10"}
+    assert monitor.before_appointment(dates, None) == dates
+
+
+# --- Бронь и перенос на мини-сайте ----------------------------------------------
+
+class FakeBot:
+    def __init__(self):
+        self.messages = []
+
+    async def send_message(self, chat_id, text, **kwargs):
+        self.messages.append(text)
+
+
+def test_reschedule_posts_earlier_date(monkeypatch):
+    monkeypatch.setattr(monitor, "_appointment_date", "2027-10-14")
+    site = FakeSite(left=3)
+    ok, status, location = site.run(lambda c: monitor.do_real_booking(c, {}, "2027-05-10", "09:30"))
+    assert ok and status == 302 and location.endswith("/appointment/instructions")
+    [(_, _, _, body)] = site.posts()
+    body = dict(body)
+    assert body["commit"] == "Перезаписаться"
+    assert body["appointments[consulate_appointment][date]"] == "2027-05-10"
+    assert body["appointments[consulate_appointment][time]"] == "09:30"
+    assert body["appointments[consulate_appointment][facility_id]"] == "134"
+
+
+def test_reschedule_blocked_by_reserve_sends_no_post(monkeypatch):
+    monkeypatch.setattr(monitor, "_appointment_date", "2027-10-14")
+    site = FakeSite(left=2)
+    ok, _, message = site.run(lambda c: monitor.do_real_booking(c, {}, "2027-05-10", "09:30"))
+    assert not ok and "резерв" in message
+    assert site.posts() == []
+
+
+def test_cached_form_still_respects_reserve(monkeypatch):
+    monkeypatch.setattr(monitor, "_appointment_date", "2027-10-14")
+    site = FakeSite(left=2)
+
+    async def warm_then_book(c):
+        await monitor.warm_booking_form(c, {})
+        return await monitor.do_real_booking(c, {}, "2027-05-10", "09:30")
+
+    ok, _, _ = site.run(warm_then_book)
+    assert not ok and site.posts() == []
+
+
+def test_reschedule_to_later_date_sends_no_post(monkeypatch):
+    monkeypatch.setattr(monitor, "_appointment_date", "2027-10-14")
+    site = FakeSite(left=3)
+    ok, _, _ = site.run(lambda c: monitor.do_real_booking(c, {}, "2027-10-20", "09:30"))
+    assert not ok and site.posts() == []
+
+
+def test_unknown_appointment_is_read_from_site_before_reschedule():
+    site = FakeSite(left=3, appointment="14 октябрь, 2027, 09:30")
+    ok, _, _ = site.run(lambda c: monitor.do_real_booking(c, {}, "2027-05-10", "09:30"))
+    assert ok and len(site.posts()) == 1
+    assert monitor._appointment_date == "2027-10-14"
+
+
+def test_unreadable_appointment_blocks_reschedule():
+    site = FakeSite(left=3, appointment=None)
+    ok, _, _ = site.run(lambda c: monitor.do_real_booking(c, {}, "2027-05-10", "09:30"))
+    assert not ok and site.posts() == []
+
+
+def test_first_booking_needs_no_appointment():
+    site = FakeSite(gate=False, appointment=None)
+    ok, _, _ = site.run(lambda c: monitor.do_real_booking(c, {}, "2027-05-10", "09:30"))
+    assert ok
+    [(_, _, _, body)] = site.posts()
+    assert dict(body)["commit"] == "Записаться"
+
+
+def test_refresh_booking_state_reads_appointment_and_budget():
+    site = FakeSite(left=2)
+    left = site.run(lambda c: monitor.refresh_booking_state(c, {}))
+    assert left == 2
+    assert monitor._appointment_date == "2027-10-14"
+
+
+def test_refresh_booking_state_without_appointment():
+    site = FakeSite(gate=False, appointment=None)
+    assert site.run(lambda c: monitor.refresh_booking_state(c, {})) is None
+    assert monitor._appointment_date is None
+
+
+def test_successful_reschedule_updates_appointment_and_reports(monkeypatch):
+    monkeypatch.setattr(monitor, "_appointment_date", "2027-10-14")
+    site = FakeSite(left=3, appointment="10 май, 2027, 09:30")  # так сайт покажет запись после POST
+    bot = FakeBot()
+    booked = site.run(lambda c: monitor.try_autobook(c, {}, bot, "2027-05-10", "09:30"))
+    assert booked
+    assert monitor._appointment_date == "2027-05-10"
+    report = bot.messages[-1]
+    assert "2027-10-14 → 2027-05-10" in report
+    assert "подтверждено" in report
+    assert "осталось 2" in report

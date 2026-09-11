@@ -37,6 +37,11 @@ INTERVAL_SCHEDULE = [
     ("день",  11, 12, 45, 48),  # 11:00–12:00
     ("вечер", 12, 20, 115, 150),  # 12:00–20:00
 ]
+# Суббота и воскресенье: утреннего окна нет, дневной темп растянут на 08:00–12:00.
+WEEKEND_INTERVAL_SCHEDULE = [
+    ("день",  8, 12, 45, 48),   # 08:00–12:00
+    ("вечер", 12, 20, 115, 150),  # 12:00–20:00
+]
 # Ночью (20:00–08:00) достаточно одной проверки в минуту суммарно: интервал задаётся
 # на канал, поэтому 180 при трёх каналах даёт шаг цикла 60с. Диапазон, а не точное
 # число — чтобы запросы не шли идеально периодично.
@@ -75,20 +80,23 @@ def take_backoff() -> int:
     return pause
 
 
-def pick_interval():
-    """Возвращает (метка, интервал_сек) по текущему часу Астаны."""
-    hour = datetime.now(ASTANA_TZ).hour
-    for label, start, end, lo, hi in INTERVAL_SCHEDULE:
-        if start <= hour < end:
+def pick_interval(now: datetime | None = None):
+    """Возвращает (метка, интервал_сек) по часу и дню недели в Астане."""
+    now = now or datetime.now(ASTANA_TZ)
+    schedule = WEEKEND_INTERVAL_SCHEDULE if now.weekday() >= 5 else INTERVAL_SCHEDULE
+    for label, start, end, lo, hi in schedule:
+        if start <= now.hour < end:
             return label, random.randint(lo, hi)
     return "ночь", random.randint(*NIGHT_INTERVAL)
 
 
 def schedule_summary():
-    parts = [f"{label} {s:02d}:00-{e:02d}:00 → {lo}-{hi}с"
-             for label, s, e, lo, hi in INTERVAL_SCHEDULE]
-    parts.append(f"ночь → {NIGHT_INTERVAL[0]}-{NIGHT_INTERVAL[1]}с")
-    return " | ".join(parts)
+    def fmt(schedule):
+        return " | ".join(f"{label} {s:02d}:00-{e:02d}:00 → {lo}-{hi}с"
+                          for label, s, e, lo, hi in schedule)
+    night = f"ночь → {NIGHT_INTERVAL[0]}-{NIGHT_INTERVAL[1]}с"
+    return (f"будни: {fmt(INTERVAL_SCHEDULE)} | {night}; "
+            f"выходные: {fmt(WEEKEND_INTERVAL_SCHEDULE)} | {night}")
 ERROR_ALERT_THRESHOLD = int(os.getenv("ERROR_ALERT_THRESHOLD", "5"))
 SCHEDULE_ID      = os.getenv("SCHEDULE_ID", "")
 MAX_DATE         = os.getenv("MAX_DATE", "")
@@ -111,6 +119,7 @@ SIGN_IN_URL = f"{BASE_URL}/users/sign_in"
 DAYS_URL    = f"{BASE_URL}/schedule/{SCHEDULE_ID}/appointment/days/134.json?appointments[expedite]=false"
 TIMES_URL   = f"{BASE_URL}/schedule/{SCHEDULE_ID}/appointment/times/134.json?date={{date}}&appointments[expedite]=false"
 BOOKING_URL = f"{BASE_URL}/schedule/{SCHEDULE_ID}/appointment"
+ACCOUNT_URL = f"{BASE_URL}/account"  # редиректит на страницу группы с текущей записью
 BOOKED_FILE = "booked.json"
 BROWSER_UA  = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
@@ -157,6 +166,11 @@ REPORT_EVERY = int(os.getenv("REPORT_EVERY", "500"))
 # в AUTOBOOK_RANGES. Границы диапазонов заданы абсолютными датами, и когда сегодняшнее
 # число войдёт внутрь диапазона, без этого фильтра кандидатом стал бы и завтрашний день.
 AUTOBOOK_MIN_LEAD_DAYS = int(os.getenv("AUTOBOOK_MIN_LEAD_DAYS", "2"))
+
+# Сайт разрешает всего 3 отмены/переноса, после лимита запись блокируется навсегда.
+# Бот переносит, только пока попыток по счётчику сайта строго больше резерва: при 3
+# попытках и резерве 2 это ровно один автоперенос, остальные остаются на ручные.
+RESCHEDULE_RESERVE = int(os.getenv("RESCHEDULE_RESERVE", "2"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -304,16 +318,6 @@ def load_cookies() -> dict:
     if os.path.exists("cookies.json"):
         try:
             with open("cookies.json", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
-def load_booked() -> dict:
-    if os.path.exists(BOOKED_FILE):
-        try:
-            with open(BOOKED_FILE, encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
@@ -612,6 +616,30 @@ def date_in_autobook_ranges(date_str: str, ranges: list[tuple[str, str]], today:
     return False
 
 
+def parse_limit_remaining(page_html: str) -> int | None:
+    """Сколько отмен/переносов осталось по предупреждению сайта; None — предупреждения нет."""
+    m = re.search(r"осталось\s+(\d+)\s+попыт", page_html)
+    return int(m.group(1)) if m else None
+
+
+# Сайт пишет месяц в именительном падеже («14 октябрь, 2027»), родительный тоже принимаем.
+_RU_MONTHS = {"янв": 1, "фев": 2, "мар": 3, "апр": 4, "май": 5, "мая": 5, "июн": 6,
+              "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12}
+
+
+def parse_current_appointment(page_html: str) -> str | None:
+    """ISO-дата консульского собеседования со страницы группы; None — записи не видно."""
+    block = re.search(r"<p class=['\"]consular-appt['\"][^>]*>(.*?)</p>", page_html, re.S)
+    if not block:
+        return None
+    text = html.unescape(re.sub(r"<[^>]+>", " ", block.group(1)))
+    m = re.search(r"(\d{1,2})\s+([а-яё]+),?\s+(\d{4})", text, re.IGNORECASE)
+    month = _RU_MONTHS.get(m.group(2)[:3].lower()) if m else None
+    if not month:
+        return None
+    return date_cls(int(m.group(3)), month, int(m.group(1))).isoformat()
+
+
 def parse_booking_form(page_html: str) -> tuple[str, dict[str, str]]:
     form_match = re.search(
         r'<form[^>]*action="([^"]*appointment[^"]*)"[^>]*method="post"',
@@ -647,7 +675,30 @@ def parse_booking_form(page_html: str) -> tuple[str, dict[str, str]]:
     return action, fields
 
 
-# Прогретая форма бронирования: {"action", "fields", "cookie_sig", "at"}.
+def parse_gate_form(page_html: str) -> tuple[str, list[tuple[str, str]]] | None:
+    """Промежуточная GET-форма перед формой брони, когда запись уже есть: предупреждение
+    о лимите переносов («Я понимаю») или выбор заявителей. Возвращает (url, параметры)
+    со всеми галочками — переносим всю группу целиком. None — такой формы на странице нет."""
+    m = re.search(r'<form[^>]*action="([^"]*appointment[^"]*)"[^>]*method="get"', page_html, re.IGNORECASE)
+    if not m:
+        return None
+    url = html.unescape(m.group(1))
+    if url.startswith("/"):
+        url = "https://ais.usvisa-info.com" + url
+    end = page_html.find("</form>", m.start())
+    form_html = page_html[m.start():end if end >= 0 else len(page_html)]
+
+    params = []
+    for tag in re.findall(r"<input\b[^>]*>", form_html):
+        kind = re.search(r'type="([^"]+)"', tag)
+        name = re.search(r'name="([^"]+)"', tag)
+        value = re.search(r'value="([^"]*)"', tag)
+        if kind and name and value and kind.group(1) in ("hidden", "checkbox", "submit"):
+            params.append((html.unescape(name.group(1)), html.unescape(value.group(1))))
+    return url, params
+
+
+# Прогретая форма бронирования: {"action", "fields", "remaining", "cookie_sig", "at"}.
 # Позволяет при находке слота слать POST сразу, без GET страницы (экономит ~1-1.5с).
 _form_cache: dict | None = None
 
@@ -660,37 +711,56 @@ def invalidate_form_cache(reason: str = ""):
 
 
 def get_cached_form(cookies: dict):
-    """Возвращает (action, fields) из кеша, либо None если кеша нет/протух/сессия сменилась."""
+    """(action, fields, remaining) из кеша, либо None если кеша нет/протух/сессия сменилась."""
     if not _form_cache:
         return None
     if _form_cache["cookie_sig"] != cookie_header(cookies):
         return None
     if (datetime.now() - _form_cache["at"]).total_seconds() > FORM_CACHE_TTL:
         return None
-    return _form_cache["action"], dict(_form_cache["fields"])
+    return _form_cache["action"], dict(_form_cache["fields"]), _form_cache["remaining"]
 
 
-async def fetch_booking_form(client, cookies: dict) -> tuple[str, dict]:
-    """GET страницы брони + разбор формы, результат кладётся в кеш. RuntimeError при неудаче."""
+async def fetch_booking_form(client, cookies: dict) -> tuple[str, dict, int | None]:
+    """GET формы брони, результат кладётся в кеш. RuntimeError при неудаче.
+
+    Когда запись уже есть, до формы две промежуточные GET-страницы: предупреждение о лимите
+    переносов и выбор заявителей. remaining — сколько переносов осталось по предупреждению;
+    None — предупреждения не было, записи нет и это первая бронь. Если промежуточная страница
+    была, а счётчик не прочитался, форму не отдаём: переносить вслепую нельзя."""
     global _form_cache
-    try:
-        page = await client.get(BOOKING_URL, headers=booking_page_headers(cookies), timeout=30)
-    except Exception as e:
-        raise RuntimeError(f"GET формы упал: {e}") from e
-    if page.status_code != 200:
-        raise RuntimeError(f"GET формы вернул {page.status_code}")
-    try:
-        action, fields = parse_booking_form(page.text)
-    except ValueError as e:
-        snippet = page.text[:300].replace("\n", " ")
-        raise RuntimeError(f"{e}. HTML начало: {snippet}") from e
+    url, params, gated, remaining = BOOKING_URL, None, False, None
+    for _ in range(4):
+        try:
+            page = await client.get(url, params=params, headers=booking_page_headers(cookies), timeout=30)
+        except Exception as e:
+            raise RuntimeError(f"GET формы упал: {e}") from e
+        if page.status_code != 200:
+            raise RuntimeError(f"GET формы вернул {page.status_code}")
+        if remaining is None:
+            remaining = parse_limit_remaining(page.text)
+        try:
+            action, fields = parse_booking_form(page.text)
+            break
+        except ValueError as e:
+            gate = parse_gate_form(page.text)
+            if not gate:
+                snippet = page.text[:300].replace("\n", " ")
+                raise RuntimeError(f"{e}. HTML начало: {snippet}") from e
+            url, params = gate
+            gated = True
+    else:
+        raise RuntimeError("Форма бронирования не найдена за промежуточными страницами")
+    if gated and remaining is None:
+        raise RuntimeError("Запись уже есть, но число оставшихся попыток переноса не прочиталось")
     _form_cache = {
         "action": action,
         "fields": fields,
+        "remaining": remaining,
         "cookie_sig": cookie_header(cookies),
         "at": datetime.now(),
     }
-    return action, dict(fields)
+    return action, dict(fields), remaining
 
 
 async def warm_booking_form(client, cookies: dict):
@@ -698,17 +768,75 @@ async def warm_booking_form(client, cookies: dict):
     if get_cached_form(cookies):
         return
     try:
-        _, fields = await fetch_booking_form(client, cookies)
+        _, fields, remaining = await fetch_booking_form(client, cookies)
         log.info(
             f"Прогрев формы брони: ок, полей={len(fields)}, "
-            f"csrf={'есть' if fields.get('authenticity_token') else 'НЕТ'}"
+            f"csrf={'есть' if fields.get('authenticity_token') else 'НЕТ'}, "
+            f"переносов осталось={'—' if remaining is None else remaining}"
         )
     except RuntimeError as e:
         log.warning(f"Прогрев формы брони не удался: {e}")
 
 
+# Дата текущего собеседования на сайте (ISO). None — не знаем или записи нет.
+_appointment_date: str | None = None
+
+
+async def fetch_current_appointment(client, cookies: dict) -> str | None:
+    """Дата текущей записи со страницы группы; None — записи нет или страница не прочиталась."""
+    try:
+        page = await client.get(ACCOUNT_URL, headers=booking_page_headers(cookies),
+                                timeout=30, follow_redirects=True)
+    except Exception as e:
+        log.warning(f"Не удалось открыть страницу аккаунта: {e}")
+        return None
+    return parse_current_appointment(page.text) if page.status_code == 200 else None
+
+
+async def refresh_appointment(client, cookies: dict) -> str | None:
+    """Перечитывает текущую запись с сайта. Если не прочиталась, держим последнюю известную."""
+    global _appointment_date
+    seen = await fetch_current_appointment(client, cookies)
+    if seen and seen != _appointment_date:
+        log.info(f"Текущая запись на сайте: {seen}")
+        _appointment_date = seen
+    return _appointment_date
+
+
+async def refresh_booking_state(client, cookies: dict) -> int | None:
+    """Прогрев формы + перечитывание текущей записи. Возвращает остаток переносов
+    по счётчику сайта; None — записи нет или форма не прочиталась."""
+    await warm_booking_form(client, cookies)
+    await refresh_appointment(client, cookies)
+    cached = get_cached_form(cookies)
+    return cached[2] if cached else None
+
+
+def reschedules_exhausted(remaining: int | None) -> bool:
+    """Переносов по счётчику сайта осталось не больше резерва. None — записи нет, лимит не при чём."""
+    return remaining is not None and remaining <= RESCHEDULE_RESERVE
+
+
+def reschedule_refusal(date: str, remaining: int | None, appointment_date: str | None) -> str:
+    """Причина не отправлять POST, либо "" если можно. remaining=None — первая бронь."""
+    if remaining is None:
+        return ""
+    if reschedules_exhausted(remaining):
+        return f"переносов осталось {remaining}, резерв {RESCHEDULE_RESERVE} — запись не трогаю"
+    if not appointment_date:
+        return "текущая запись не прочиталась — переносить вслепую не буду"
+    if date >= appointment_date:
+        return f"{date} не раньше текущей записи {appointment_date}"
+    return ""
+
+
+def before_appointment(dates: set, appointment_date: str | None) -> set:
+    """Только даты раньше текущей записи: перенос на более позднюю сделал бы хуже."""
+    return {d for d in dates if d < appointment_date} if appointment_date else set(dates)
+
+
 async def do_real_booking(client, cookies: dict, date: str, time: str) -> tuple[bool, int, str]:
-    """Реальный POST на бронирование. Возвращает (success, status_code, message)."""
+    """Реальный POST на бронирование или перенос. Возвращает (success, status_code, message)."""
     page_headers = booking_page_headers(cookies)
     last_status, last_msg = 0, "попытка брони не выполнена"
 
@@ -716,14 +844,23 @@ async def do_real_booking(client, cookies: dict, date: str, time: str) -> tuple[
     for attempt in range(2):
         cached = get_cached_form(cookies) if attempt == 0 else None
         if cached:
-            action, fields = cached
+            action, fields, remaining = cached
             log.info(f"AUTOBOOK: форма из прогретого кеша для {date} {time}")
         else:
             log.info(f"AUTOBOOK: GET формы для {date} {time}")
             try:
-                action, fields = await fetch_booking_form(client, cookies)
+                action, fields, remaining = await fetch_booking_form(client, cookies)
             except RuntimeError as e:
                 return False, last_status, str(e)
+
+        # Запись уже есть — значит, это перенос. Без знания текущей даты сравнивать не с чем,
+        # поэтому перечитываем её с сайта прямо сейчас.
+        if remaining is not None and not _appointment_date:
+            await refresh_appointment(client, cookies)
+        refusal = reschedule_refusal(date, remaining, _appointment_date)
+        if refusal:
+            log.warning(f"AUTOBOOK: POST не отправлен — {refusal}")
+            return False, 0, refusal
 
         fields["appointments[consulate_appointment][facility_id]"] = "134"
         fields["appointments[consulate_appointment][date]"] = date
@@ -777,6 +914,7 @@ async def do_real_booking(client, cookies: dict, date: str, time: str) -> tuple[
 
 
 async def try_autobook(client, cookies: dict, bot, date: str, time: str) -> bool:
+    global _appointment_date
     deep_link = (
         f"{BOOKING_URL}?"
         f"appointments[consulate_appointment][facility_id]=134&"
@@ -794,17 +932,31 @@ async def try_autobook(client, cookies: dict, bot, date: str, time: str) -> bool
         return False
 
     log.info(f"AUTOBOOK LIVE: пытаюсь забронировать {date} {time}")
+    previous = _appointment_date
     success, status, message = await do_real_booking(client, cookies, date, time)
     if success:
         save_booked(date, time, status, message)
+        # Запись изменилась: старая форма и счётчик в кеше больше не годятся
+        invalidate_form_cache("запись изменилась")
+        seen = await fetch_current_appointment(client, cookies)
+        _appointment_date = seen or date
+        check = ("✅ подтверждено на сайте" if seen == date
+                 else f"⚠️ на сайте вижу {seen or 'не прочиталось'} — проверь вручную")
+        await warm_booking_form(client, cookies)
+        cached = get_cached_form(cookies)
+        left = cached[2] if cached else None
+        budget = ("остаток переносов не прочитался" if left is None
+                  else f"переносов осталось {left}, резерв {RESCHEDULE_RESERVE}")
+        what = f"перенос {previous} → {date}" if previous else f"бронь {date}"
         await send_telegram(
             bot,
-            f"✅ <b>AUTOBOOK УСПЕШНО</b>\n"
-            f"  📅 <b>{date} {time}</b>\n"
+            f"✅ <b>AUTOBOOK УСПЕШНО</b>: {what} {time}\n"
+            f"  {check}\n"
+            f"  {budget}\n"
             f"  HTTP {status} → {message}\n\n"
-            f"⚠️ <b>СРОЧНО открой личный кабинет и проверь</b> — возможно нужно подтвердить страховку/оплату.\n"
             f"🔗 <a href='{BOOKING_URL}'>Перейти к записи →</a>",
         )
+        log.info(f"AUTOBOOK: {what} {time}; {check}; {budget}")
         return True
     await send_telegram(
         bot,
@@ -874,31 +1026,36 @@ async def main():
 
         log.info("Монитор запущен. Расписание (Астана): %s", schedule_summary())
         autobook_ranges = parse_autobook_ranges(AUTOBOOK_RANGES) if AUTOBOOK_ENABLED else []
-        booked_state = load_booked()
-        if AUTOBOOK_ENABLED and booked_state:
-            log.warning(
-                f"booked.json найден ({booked_state.get('date')} {booked_state.get('time')}), "
-                "autobook отключён до удаления файла."
-            )
-            autobook_ranges = []
-            autobook_status = (
-                f"\n🤖 Autobook: <b>ОТКЛЮЧЁН</b> — booked.json: "
-                f"{booked_state.get('date')} {booked_state.get('time')}"
-            )
-        elif AUTOBOOK_ENABLED:
-            today = datetime.now(ASTANA_TZ).date()
-            preview = "; ".join(
-                f"{resolve_date(a, today)}…{resolve_date(b, today)}"
-                for a, b in autobook_ranges
-            ) or "(пусто)"
-            log.info(
-                f"Autobook включён, dry-run={AUTOBOOK_DRY_RUN}, "
-                f"мин. запас {AUTOBOOK_MIN_LEAD_DAYS} дн., диапазоны: {preview}"
-            )
-            autobook_status = (
-                f"\n🤖 Autobook: <b>{'DRY-RUN' if AUTOBOOK_DRY_RUN else 'LIVE'}</b>, "
-                f"не ближе {AUTOBOOK_MIN_LEAD_DAYS} дн., диапазоны: {preview}"
-            )
+        if AUTOBOOK_ENABLED:
+            # Защита от лишней брони — текущая запись и счётчик переносов с самого сайта,
+            # а не локальный файл. Если куки протухли, здесь ничего не прочитается —
+            # do_real_booking перечитает запись сам и без неё переносить не станет.
+            if AUTOBOOK_DRY_RUN:
+                await refresh_appointment(client, cookies)
+                left = None
+            else:
+                left = await refresh_booking_state(client, cookies)
+            appt = f"текущая запись: {_appointment_date or 'нет или не прочиталась'}"
+            budget = "" if left is None else f", переносов осталось {left}, резерв {RESCHEDULE_RESERVE}"
+            if reschedules_exhausted(left):
+                autobook_ranges = []
+                log.warning(f"Autobook отключён: {appt}{budget}")
+                autobook_status = f"\n🤖 Autobook: <b>ОТКЛЮЧЁН</b> — {appt}{budget}"
+            else:
+                today = datetime.now(ASTANA_TZ).date()
+                preview = "; ".join(
+                    f"{resolve_date(a, today)}…{resolve_date(b, today)}"
+                    for a, b in autobook_ranges
+                ) or "(пусто)"
+                log.info(
+                    f"Autobook включён, dry-run={AUTOBOOK_DRY_RUN}, "
+                    f"мин. запас {AUTOBOOK_MIN_LEAD_DAYS} дн., диапазоны: {preview}; {appt}{budget}"
+                )
+                autobook_status = (
+                    f"\n🤖 Autobook: <b>{'DRY-RUN' if AUTOBOOK_DRY_RUN else 'LIVE'}</b>, "
+                    f"не ближе {AUTOBOOK_MIN_LEAD_DAYS} дн., диапазоны: {preview}"
+                    f"\n📌 {appt}{budget}"
+                )
         else:
             autobook_status = ""
 
@@ -960,7 +1117,8 @@ async def main():
                     today = datetime.now(ASTANA_TZ).date()
                     # ISO-даты сравниваются как строки, поэтому границу держим строкой
                     min_lead = (today + timedelta(days=AUTOBOOK_MIN_LEAD_DAYS)).isoformat()
-                    autobook_pending &= set(available)  # выпавшие из календаря забываем
+                    # Выпавшие из календаря и не раньше текущей записи забываем
+                    autobook_pending = before_appointment(autobook_pending & set(available), _appointment_date)
 
                     # Дата, до которой уже не успеть доехать, годной со временем не станет —
                     # убираем её из очереди совсем, чтобы не перебирать каждую итерацию.
@@ -972,7 +1130,10 @@ async def main():
                         )
                         autobook_pending -= stale
 
-                    fresh = {d for d in new_dates if date_in_autobook_ranges(d, autobook_ranges, today)}
+                    fresh = before_appointment(
+                        {d for d in new_dates if date_in_autobook_ranges(d, autobook_ranges, today)},
+                        _appointment_date,
+                    )
                     too_soon = {d for d in fresh if d < min_lead}
                     if too_soon:
                         log.info(
@@ -995,9 +1156,8 @@ async def main():
                             autobook_pending.discard(date)
                         booked = await try_autobook(client, cookies, bot, date, times_cache[date][0])
                         if booked:
-                            autobook_ranges = []
+                            # Продолжать или нет, решает счётчик переносов ниже, на шаге прогрева
                             autobook_pending.clear()
-                            log.info("AUTOBOOK: бронь успешна, дальнейшие попытки отключены")
                             break
 
                 if new_dates:
@@ -1069,8 +1229,18 @@ async def main():
 
                 # Держим форму брони разобранной заранее: при находке слота POST уйдёт
                 # сразу, без GET страницы. Актуально только для живого автобронирования.
+                # Заодно раз в FORM_CACHE_TTL перечитываем запись и счётчик переносов: если
+                # попытки ушли (ботом или вручную), автобронь выключается.
                 if autobook_ranges and not AUTOBOOK_DRY_RUN:
-                    await warm_booking_form(client, cookies)
+                    cached = get_cached_form(cookies)
+                    left = cached[2] if cached else await refresh_booking_state(client, cookies)
+                    if reschedules_exhausted(left):
+                        autobook_ranges = []
+                        autobook_pending.clear()
+                        msg = (f"Автоперенос выключен: переносов осталось {left}, "
+                               f"резерв {RESCHEDULE_RESERVE}. Дальше только уведомления")
+                        log.warning(msg)
+                        await send_telegram(bot, f"🛑 {msg}")
 
             backoff = take_backoff()
             if backoff:
