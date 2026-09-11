@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import types
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 
@@ -421,3 +422,108 @@ def test_report_all_dates_header_uses_astana_time(monkeypatch):
     bot = FakeBot()
     asyncio.run(monitor.report_all_dates(bot, ["2027-10-06"], set(), "окон стало больше: 0 → 1", grew=True))
     assert "(11.09.2026 13:25)" in bot.messages[0]
+
+
+# --- Отказ соединения: ход следующему каналу ------------------------------------
+
+TWO_CHANNELS = ["zeus=socks5://127.0.0.1:1081", "hessen=socks5://127.0.0.1:1082"]
+
+
+@pytest.fixture
+def fast_retries(monkeypatch):
+    monkeypatch.setattr(monitor, "TRANSIENT_BACKOFF", (0, 0, 0))
+    monkeypatch.setattr(monitor, "random", types.SimpleNamespace(randint=lambda a, b: 0))
+    monkeypatch.setattr(monitor, "PIN_TARGET_IP", True)
+
+
+def run_days(responses):
+    """days.json отдаёт по очереди элементы responses: исключение или список дат.
+    Возвращает (даты, сколько было запросов)."""
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        item = responses[min(len(calls), len(responses)) - 1]
+        if isinstance(item, Exception):
+            raise item
+        return httpx.Response(200, json=[{"date": d, "business_day": True} for d in item])
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            dates, _ = await monitor.fetch_available_days(client, {}, FakeBot(), max_date="")
+            return dates
+
+    return asyncio.run(go()), len(calls)
+
+
+def socks_refusal():
+    socksio = pytest.importorskip("socksio")
+    return socksio.exceptions.ProtocolError("Malformed reply")
+
+
+@pytest.mark.parametrize("refusal", [lambda: httpx.ConnectError("refused"), socks_refusal],
+                         ids=["ConnectError", "SOCKS ProtocolError"])
+def test_connect_refusal_hands_turn_to_next_channel(monkeypatch, fast_retries, refusal):
+    monkeypatch.setattr(monitor, "WORKER_PROXIES", TWO_CHANNELS)
+    dates, calls = run_days([refusal(), ["2027-10-06"]])
+    assert dates is None
+    assert calls == 1  # ни одного ретрая через тот же канал
+
+
+def test_read_timeout_is_still_retried(monkeypatch, fast_retries):
+    monkeypatch.setattr(monitor, "WORKER_PROXIES", TWO_CHANNELS)
+    dates, calls = run_days([httpx.ReadTimeout("slow"), ["2027-10-06"]])
+    assert dates == ["2027-10-06"] and calls == 2
+
+
+def test_single_channel_keeps_retrying_connect_refusal(monkeypatch, fast_retries):
+    monkeypatch.setattr(monitor, "WORKER_PROXIES", ["direct"])
+    dates, calls = run_days([httpx.ConnectError("refused"), ["2027-10-06"]])
+    assert dates == ["2027-10-06"] and calls == 2
+
+
+# --- Суточная сводка по каналам -------------------------------------------------
+
+def test_parse_worker_with_and_without_name():
+    assert monitor.parse_worker("zeus=socks5://127.0.0.1:1081") == ("zeus", "socks5://127.0.0.1:1081")
+    assert monitor.parse_worker("socks5://127.0.0.1:1081") == ("socks5://127.0.0.1:1081", "socks5://127.0.0.1:1081")
+    assert monitor.parse_worker("direct") == ("direct", "direct")
+
+
+def test_channel_report_summarises_each_channel():
+    stats = monitor.ChannelStats(astana(2026, 9, 10, 8))
+    for ok in [True] * 9 + [False]:
+        stats.note_check("zeus", ok)
+    stats.note_check("hessen", True)
+    for _ in range(3):
+        stats.note_quarantine("zeus")
+    text = stats.report(astana(2026, 9, 11, 8))
+    assert "10.09 08:00 → 11.09 08:00" in text
+    assert "zeus — 90.0% (провалов 1 из 10, карантинов 3)" in text
+    assert "hessen — 100.0% (провалов 0 из 1, карантинов 0)" in text
+
+
+def test_channel_report_due_once_a_day_at_report_hour(monkeypatch):
+    monkeypatch.setattr(monitor, "CHANNEL_REPORT_HOUR", 8)
+    stats = monitor.ChannelStats(astana(2026, 9, 11, 15))  # запуск после 08:00 — сегодня уже не шлём
+    assert not stats.due(astana(2026, 9, 11, 23))
+    assert not stats.due(astana(2026, 9, 12, 7, 59))
+    assert stats.due(astana(2026, 9, 12, 8, 0))
+    stats.reset(astana(2026, 9, 12, 8, 0))
+    assert not stats.due(astana(2026, 9, 12, 9))
+
+
+def test_channel_report_due_same_morning_after_night_start(monkeypatch):
+    monkeypatch.setattr(monitor, "CHANNEL_REPORT_HOUR", 8)
+    assert monitor.ChannelStats(astana(2026, 9, 12, 3)).due(astana(2026, 9, 12, 8, 1))
+
+
+def test_transport_quarantine_counts_for_its_channel(monkeypatch):
+    stats = monitor.ChannelStats(astana(2026, 9, 11, 8))
+    monkeypatch.setattr(monitor, "_channel_stats", stats)
+    transport = monitor.PinnedHostTransport(label="zeus")
+    transport._mark_bad("18.254.13.15", httpx.ConnectError("refused"))
+    transport._mark_bad("18.254.13.15", httpx.ConnectError("refused"))  # уже в карантине — не считается
+    transport._mark_bad("18.254.10.38", httpx.ConnectError("refused"))
+    stats.note_check("zeus", True)
+    assert "zeus — 100.0% (провалов 0 из 1, карантинов 2)" in stats.report(astana(2026, 9, 12, 8))

@@ -161,6 +161,9 @@ IP_ATTEMPTS   = int(os.getenv("IP_ATTEMPTS", "3"))      # сколько адр�
 # С ротацией по каналам проверок стало кратно больше, и на 100 сводки шли слишком часто.
 REPORT_EVERY = int(os.getenv("REPORT_EVERY", "500"))
 
+# Час Астаны, в который раз в сутки уходит сводка по выходным каналам.
+CHANNEL_REPORT_HOUR = int(os.getenv("CHANNEL_REPORT_HOUR", "8"))
+
 # Минимальный запас по времени до даты собеседования: на окно «завтра» физически
 # не успеть доехать, поэтому такие даты автобронь пропускает, даже если они попадают
 # в AUTOBOOK_RANGES. Границы диапазонов заданы абсолютными датами, и когда сегодняшнее
@@ -199,6 +202,57 @@ except ImportError:
     _SOCKS_ERRORS = ()
 
 CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) + _SOCKS_ERRORS
+
+
+def parse_worker(spec: str) -> tuple[str, str]:
+    """'zeus=socks5://127.0.0.1:1081' → ('zeus', 'socks5://…'). Без имени меткой служит сам адрес."""
+    name, sep, url = spec.partition("=")
+    if sep and "://" not in name:
+        return name.strip(), url.strip()
+    return spec, spec
+
+
+class ChannelStats:
+    """Счётчики по выходным каналам между суточными сводками в Telegram."""
+
+    def __init__(self, now: datetime):
+        self.since = now
+        # Запуск после часа сводки — сегодняшняя уже «прошла», следующая завтра утром
+        self.last_report_day = now.date() if now.hour >= CHANNEL_REPORT_HOUR else now.date() - timedelta(days=1)
+        self.data: dict[str, dict[str, int]] = {}
+
+    def _counter(self, channel: str) -> dict[str, int]:
+        return self.data.setdefault(channel, {"checks": 0, "fail": 0, "quar": 0})
+
+    def note_check(self, channel: str, ok: bool):
+        counter = self._counter(channel)
+        counter["checks"] += 1
+        counter["fail"] += 0 if ok else 1
+
+    def note_quarantine(self, channel: str):
+        self._counter(channel)["quar"] += 1
+
+    def due(self, now: datetime) -> bool:
+        return now.hour >= CHANNEL_REPORT_HOUR and now.date() > self.last_report_day
+
+    def report(self, now: datetime) -> str:
+        lines = [f"📊 <b>Каналы</b> ({self.since:%d.%m %H:%M} → {now:%d.%m %H:%M}, Астана)"]
+        for channel, c in self.data.items():
+            if c["checks"]:
+                ok = 100 * (c["checks"] - c["fail"]) / c["checks"]
+                lines.append(f"  {channel} — {ok:.1f}% (провалов {c['fail']} из {c['checks']}, "
+                             f"карантинов {c['quar']})")
+            else:
+                lines.append(f"  {channel} — проверок не было (карантинов {c['quar']})")
+        if len(lines) == 1:
+            lines.append("  проверок не было")
+        return "\n".join(lines)
+
+    def reset(self, now: datetime):
+        self.since, self.last_report_day, self.data = now, now.date(), {}
+
+
+_channel_stats = ChannelStats(datetime.now(ASTANA_TZ))
 
 
 async def resolve_target() -> list:
@@ -268,6 +322,7 @@ class PinnedHostTransport(httpx.AsyncHTTPTransport):
         if self._quarantine.get(ip, 0) <= time.monotonic():
             log.warning(f"[{self._label}] адрес {ip} не пускает ({type(exc).__name__}), "
                         f"карантин {IP_QUARANTINE}с")
+            _channel_stats.note_quarantine(self._label)
         self._quarantine[ip] = time.monotonic() + IP_QUARANTINE
         if self._sticky == ip:
             self._sticky = None
@@ -468,6 +523,14 @@ async def fetch_available_days(client, cookies, bot, max_date: str = MAX_DATE):
         try:
             resp = await client.get(DAYS_URL, headers=build_headers(cookies), timeout=30, follow_redirects=False)
         except (httpx.TimeoutException, httpx.TransportError) + _SOCKS_ERRORS as e:
+            # Ошибка соединения значит, что транспорт уже перебрал адреса сайта через этот
+            # канал и ни один не пустил. Повтор через тот же канал спасал проверку 6 раз из
+            # 245 (zeus, 09-11.09), а стоил ~18 с простоя цикла, поэтому при нескольких
+            # каналах ход сразу переходит к следующему. Таймауты чтения и обрывы ретраим:
+            # там повтор почти всегда проходит.
+            if isinstance(e, CONNECT_ERRORS) and PIN_TARGET_IP and len(WORKER_PROXIES) > 1:
+                log.warning(f"Канал не достучался до сайта ({type(e).__name__}), ход следующему каналу")
+                return None, cookies
             if transient < TRANSIENT_RETRIES:
                 wait = transient_wait()
                 transient += 1
@@ -1045,22 +1108,23 @@ async def main():
     async with contextlib.AsyncExitStack() as stack:
         channels = []
         for spec in WORKER_PROXIES:
-            proxy = None if spec.lower() in ("direct", "none", "-") else spec
+            label, url = parse_worker(spec)
+            proxy = None if url.lower() in ("direct", "none", "-") else url
             try:
                 client = await stack.enter_async_context(
                     httpx.AsyncClient(
                         follow_redirects=True,
-                        transport=PinnedHostTransport(proxy=proxy, label=spec),
+                        transport=PinnedHostTransport(proxy=proxy, label=label),
                     )
                 )
             except Exception as e:
                 log.error(f"Канал {spec} не поднялся ({e}), пропускаю")
                 continue
-            channels.append((spec, client))
+            channels.append((label, client))
         if not channels:
             log.error("Ни один выходной канал не доступен — проверьте WORKER_PROXIES")
             return
-        log.info("Выходные каналы: %s", ", ".join(spec for spec, _ in channels))
+        log.info("Выходные каналы: %s", ", ".join(label for label, _ in channels))
 
         client = channels[0][1]  # для стартового логина
         cookies = load_cookies()
@@ -1133,6 +1197,7 @@ async def main():
             # MAX_DATE фильтруется локально, поэтому берём полный список одним запросом
             # и уже из него получаем отфильтрованный для основной логики.
             all_dates, cookies = await fetch_available_days(client, cookies, bot, max_date="")
+            _channel_stats.note_check(spec, all_dates is not None)
             available = None if all_dates is None else (
                 [d for d in all_dates if d <= MAX_DATE] if MAX_DATE else list(all_dates)
             )
@@ -1269,6 +1334,11 @@ async def main():
                                f"резерв {RESCHEDULE_RESERVE}. Дальше только уведомления")
                         log.warning(msg)
                         await send_telegram(bot, f"🛑 {msg}")
+
+            now_astana = datetime.now(ASTANA_TZ)
+            if _channel_stats.due(now_astana):
+                await send_telegram(bot, _channel_stats.report(now_astana))
+                _channel_stats.reset(now_astana)
 
             backoff = take_backoff()
             if backoff:
