@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 
 import httpx
@@ -404,3 +404,20 @@ def test_report_all_dates_logs_lost_message_with_dates(caplog, no_pauses):
     line = full_list_log_line(caplog)
     assert line.startswith("НЕ доставлен полный список")
     assert "2027-10-06, 2027-10-15" in line
+
+
+def test_report_all_dates_header_uses_astana_time(monkeypatch):
+    class VpsClock(datetime):
+        """Часы VPS в Бишкеке (UTC+6): 14:25 по ним — это 13:25 в Астане."""
+
+        @classmethod
+        def now(cls, tz=None):
+            moment = datetime(2026, 9, 11, 8, 25, tzinfo=timezone.utc)
+            if tz:
+                return moment.astimezone(tz)
+            return moment.astimezone(timezone(timedelta(hours=6))).replace(tzinfo=None)
+
+    monkeypatch.setattr(monitor, "datetime", VpsClock)
+    bot = FakeBot()
+    asyncio.run(monitor.report_all_dates(bot, ["2027-10-06"], set(), "окон стало больше: 0 → 1", grew=True))
+    assert "(11.09.2026 13:25)" in bot.messages[0]

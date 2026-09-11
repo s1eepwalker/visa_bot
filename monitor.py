@@ -604,7 +604,7 @@ async def report_all_dates(bot, all_dates, new_dates: set, reason: str, grew: bo
     sorted_all = sorted(all_dates)
     header = (
         f"{'📈' if grew else '✅'} <b>Все доступные даты</b> "
-        f"({datetime.now().strftime('%d.%m.%Y %H:%M')})\n"
+        f"({datetime.now(ASTANA_TZ).strftime('%d.%m.%Y %H:%M')})\n"  # VPS живёт по Бишкеку, UTC+6
         f"<i>{reason}</i>\n"
     )
     if sorted_all:
