@@ -1,9 +1,11 @@
 import asyncio
+import logging
 from datetime import datetime
 from urllib.parse import parse_qsl
 
 import httpx
 import pytest
+from telegram.error import BadRequest, TimedOut
 
 import monitor
 from monitor import ASTANA_TZ
@@ -336,3 +338,69 @@ def test_successful_reschedule_updates_appointment_and_reports(monkeypatch):
     assert "2027-10-14 → 2027-05-10" in report
     assert "подтверждено" in report
     assert "осталось 2" in report
+
+
+# --- Доставка в Telegram --------------------------------------------------------
+
+class FlakyBot:
+    """Первые `failures` вызовов падают с исключением `exc`, дальше сообщения принимаются."""
+
+    def __init__(self, failures, exc=TimedOut):
+        self.failures, self.exc = failures, exc
+        self.calls, self.messages = 0, []
+
+    async def send_message(self, chat_id, text, **kwargs):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise self.exc("Timed out" if self.exc is TimedOut else "Can't parse entities")
+        self.messages.append(text)
+
+
+@pytest.fixture
+def no_pauses(monkeypatch):
+    monkeypatch.setattr(monitor, "TELEGRAM_RETRY_PAUSES", (0, 0))
+
+
+def test_send_telegram_retries_after_timeout(no_pauses):
+    bot = FlakyBot(failures=1)
+    assert asyncio.run(monitor.send_telegram(bot, "0 → 14")) is True
+    assert bot.calls == 2 and bot.messages == ["0 → 14"]
+
+
+def test_send_telegram_gives_up_after_three_attempts(no_pauses):
+    bot = FlakyBot(failures=10)
+    assert asyncio.run(monitor.send_telegram(bot, "0 → 14")) is False
+    assert bot.calls == 3
+
+
+def test_send_telegram_does_not_retry_bad_request(no_pauses):
+    bot = FlakyBot(failures=10, exc=BadRequest)
+    assert asyncio.run(monitor.send_telegram(bot, "<b>broken")) is False
+    assert bot.calls == 1
+
+
+def full_list_log_line(caplog) -> str:
+    return [r.getMessage() for r in caplog.records if "полный список" in r.getMessage()][-1]
+
+
+def test_report_all_dates_logs_dates_when_delivered(caplog):
+    bot = FakeBot()
+    with caplog.at_level(logging.INFO, logger="monitor"):
+        ok = asyncio.run(monitor.report_all_dates(
+            bot, ["2027-10-15", "2027-10-06"], set(), "окон стало больше: 0 → 2", grew=True))
+    assert ok
+    assert "2027-10-06" in bot.messages[0] and "окон стало больше: 0 → 2" in bot.messages[0]
+    line = full_list_log_line(caplog)
+    assert line.startswith("Отправлен полный список")
+    assert "2027-10-06, 2027-10-15" in line
+
+
+def test_report_all_dates_logs_lost_message_with_dates(caplog, no_pauses):
+    bot = FlakyBot(failures=10)
+    with caplog.at_level(logging.INFO, logger="monitor"):
+        ok = asyncio.run(monitor.report_all_dates(
+            bot, ["2027-10-15", "2027-10-06"], set(), "окон стало больше: 0 → 2", grew=True))
+    assert not ok
+    line = full_list_log_line(caplog)
+    assert line.startswith("НЕ доставлен полный список")
+    assert "2027-10-06, 2027-10-15" in line

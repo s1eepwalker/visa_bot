@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone, date as date_cls
 import httpx
 from dotenv import load_dotenv
 from telegram import Bot
-from telegram.error import TelegramError
+from telegram.error import BadRequest, NetworkError, TelegramError
 from twilio.rest import Client as TwilioClient
 
 load_dotenv()
@@ -566,12 +566,59 @@ async def fetch_times_for_date(client, cookies, date, retries: int = TIMES_RETRI
     return []
 
 
-async def send_telegram(bot: Bot, message: str):
-    try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="HTML", disable_web_page_preview=True)
-        log.info("Telegram уведомление отправлено")
-    except TelegramError as e:
-        log.error(f"Ошибка Telegram: {e}")
+# Паузы между попытками отправки в Telegram, сек. С VPS запрос обычно идёт ~0.5 с, но
+# изредка висит дольше таймаута PTB (5 с) — с апреля 2026 так пропало 312 сообщений,
+# в том числе 11.09 «окон стало больше: 0 → 14». Через пару секунд отправка проходит.
+TELEGRAM_RETRY_PAUSES = (2, 5)
+
+
+async def send_telegram(bot: Bot, message: str) -> bool:
+    """Шлёт сообщение, при сетевом сбое повторяет. True — Telegram принял.
+
+    После таймаута Telegram иногда всё же успевает принять сообщение, так что повтор
+    может дать дубль — для алертов это лучше, чем потеря."""
+    pauses = TELEGRAM_RETRY_PAUSES
+    for attempt in range(len(pauses) + 1):
+        try:
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="HTML", disable_web_page_preview=True)
+        except NetworkError as e:
+            # TimedOut — частный случай NetworkError. BadRequest тоже его наследник,
+            # но кривой запрос повтор не исправит.
+            if isinstance(e, BadRequest) or attempt == len(pauses):
+                log.error(f"Ошибка Telegram: {e}. Сообщение потеряно: {message[:80]!r}")
+                return False
+            log.warning(f"Ошибка Telegram: {e}, повтор через {pauses[attempt]}с")
+            await asyncio.sleep(pauses[attempt])
+        except TelegramError as e:
+            log.error(f"Ошибка Telegram: {e}. Сообщение потеряно: {message[:80]!r}")
+            return False
+        else:
+            log.info("Telegram уведомление отправлено" + (f" с попытки {attempt + 1}" if attempt else ""))
+            return True
+    return False
+
+
+async def report_all_dates(bot, all_dates, new_dates: set, reason: str, grew: bool) -> bool:
+    """Полный список дат без фильтра MAX_DATE. Сами даты пишутся и в лог: если сообщение
+    всё-таки потеряется, по логу его можно восстановить."""
+    sorted_all = sorted(all_dates)
+    header = (
+        f"{'📈' if grew else '✅'} <b>Все доступные даты</b> "
+        f"({datetime.now().strftime('%d.%m.%Y %H:%M')})\n"
+        f"<i>{reason}</i>\n"
+    )
+    if sorted_all:
+        limit_note = f"\n<i>Обычные алерты фильтруются до {MAX_DATE}</i>" if MAX_DATE else ""
+        dates_block = "\n".join(f"  {'🆕' if d in new_dates else '📅'} {d}" for d in sorted_all)
+        text = header + f"Всего: {len(sorted_all)}\n{dates_block}" + limit_note
+    else:
+        text = header + "Свободных слотов нет вообще."
+    delivered = await send_telegram(bot, text)
+    log.info(
+        f"{'Отправлен' if delivered else 'НЕ доставлен'} полный список ({reason}): "
+        f"всего дат {len(sorted_all)}: {', '.join(sorted_all) or '—'}"
+    )
+    return delivered
 
 
 def parse_autobook_ranges(s: str) -> list[tuple[str, str]]:
@@ -1204,26 +1251,7 @@ async def main():
                         reason = f"окон стало больше: {last_all_count} → {len(all_dates)}"
                     else:
                         reason = f"плановая сводка #{check_count}"
-                    sorted_all = sorted(all_dates)
-                    header = (
-                        f"{'📈' if all_grew else '✅'} <b>Все доступные даты</b> "
-                        f"({datetime.now().strftime('%d.%m.%Y %H:%M')})\n"
-                        f"<i>{reason}</i>\n"
-                    )
-                    if sorted_all:
-                        limit_note = (
-                            f"\n<i>Обычные алерты фильтруются до {MAX_DATE}</i>" if MAX_DATE else ""
-                        )
-                        dates_block = "\n".join(
-                            f"  {'🆕' if d in new_dates else '📅'} {d}" for d in sorted_all
-                        )
-                        await send_telegram(
-                            bot,
-                            header + f"Всего: {len(sorted_all)}\n{dates_block}" + limit_note,
-                        )
-                    else:
-                        await send_telegram(bot, header + "Свободных слотов нет вообще.")
-                    log.info(f"Отправлен полный список ({reason}): всего дат {len(all_dates)}")
+                    await report_all_dates(bot, all_dates, new_dates, reason, grew=all_grew)
 
                 last_all_count = len(all_dates)
 
