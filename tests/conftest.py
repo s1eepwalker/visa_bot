@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 
 # Изоляция от боевого .env: load_dotenv() не перезаписывает уже заданные переменные,
-# поэтому реальные логин, токены и Twilio в тесты не попадут.
+# поэтому реальные логин и токены в тесты не попадут.
 os.environ.update({
     "TELEGRAM_TOKEN": "test-token",
     "TELEGRAM_CHAT_ID": "0",
@@ -18,10 +18,6 @@ os.environ.update({
     "RESCHEDULE_RESERVE": "2",
     "WORKER_PROXIES": "direct",
     "PIN_TARGET_IP": "false",
-    "TWILIO_ACCOUNT_SID": "",
-    "TWILIO_AUTH_TOKEN": "",
-    "TWILIO_FROM_NUMBER": "",
-    "TWILIO_TO_NUMBER": "",
 })
 
 # monitor.py пишет monitor.log, cookies.json и booked.json в текущий каталог — уводим во временный.

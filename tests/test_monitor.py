@@ -254,6 +254,114 @@ class FakeBot:
         self.messages.append(text)
 
 
+def test_date_without_time_is_informational_and_uses_cached_empty_result():
+    bot = FakeBot()
+    asyncio.run(monitor.notify_new_dates(
+        None, {}, bot, {"2026-11-10"}, {"2026-11-10": []},
+    ))
+
+    assert len(bot.messages) == 1
+    assert "2026-11-10" in bot.messages[0]
+    assert "время пока не подтверждено" in bot.messages[0]
+    assert "СЛОТЫ ПОЯВИЛИСЬ" not in bot.messages[0]
+    assert "Действуйте быстро" not in bot.messages[0]
+
+
+def test_confirmed_time_gets_separate_urgent_notice():
+    bot = FakeBot()
+    asyncio.run(monitor.notify_new_dates(
+        None, {}, bot, {"2026-11-10", "2026-11-11"},
+        {"2026-11-10": [], "2026-11-11": ["09:30"]},
+    ))
+
+    assert len(bot.messages) == 2
+    urgent, informational = bot.messages
+    assert "СЛОТЫ ПОЯВИЛИСЬ" in urgent
+    assert "2026-11-11" in urgent and "09:30" in urgent
+    assert "2026-11-10" not in urgent
+    assert "2026-11-10" in informational
+    assert "2026-11-11" not in informational
+
+
+def test_main_reports_unconfirmed_date_without_sms(monkeypatch):
+    bot = FakeBot()
+    monkeypatch.setattr(monitor, "Bot", lambda token: bot)
+    monkeypatch.setattr(monitor, "AUTOBOOK_ENABLED", False)
+    monkeypatch.setattr(monitor, "WORKER_PROXIES", ["direct"])
+    monkeypatch.setattr(monitor, "load_cookies", lambda: {"session": "test"})
+
+    async def available_days(client, cookies, bot, max_date=""):
+        return ["2026-11-10"], cookies
+
+    async def empty_times(client, cookies, date, retries=0):
+        return []
+
+    def forbidden_sms(dates):
+        raise AssertionError("SMS must not be sent")
+
+    class StopAfterFirstCheck(Exception):
+        pass
+
+    async def stop_loop(seconds):
+        raise StopAfterFirstCheck()
+
+    monkeypatch.setattr(monitor, "fetch_available_days", available_days)
+    monkeypatch.setattr(monitor, "fetch_times_for_date", empty_times)
+    monkeypatch.setattr(monitor, "send_twilio_sms", forbidden_sms, raising=False)
+    monkeypatch.setattr(monitor.asyncio, "sleep", stop_loop)
+
+    with pytest.raises(StopAfterFirstCheck):
+        asyncio.run(monitor.main())
+
+    assert any("время пока не подтверждено" in message for message in bot.messages)
+    assert not any("СЛОТЫ ПОЯВИЛИСЬ" in message for message in bot.messages)
+
+
+def test_pending_autobook_date_is_rechecked_and_booked_when_time_appears(monkeypatch):
+    date = "2027-02-10"
+    bot = FakeBot()
+    day_checks, time_checks, bookings = [], [], []
+    monkeypatch.setattr(monitor, "Bot", lambda token: bot)
+    monkeypatch.setattr(monitor, "WORKER_PROXIES", ["direct"])
+    monkeypatch.setattr(monitor, "AUTOBOOK_ENABLED", True)
+    monkeypatch.setattr(monitor, "AUTOBOOK_DRY_RUN", False)
+    monkeypatch.setattr(monitor, "AUTOBOOK_RANGES", "2027-01-01:2027-05-31")
+    monkeypatch.setattr(monitor, "_appointment_date", "2027-10-14")
+    monkeypatch.setattr(monitor, "load_cookies", lambda: {"session": "test"})
+    monkeypatch.setattr(monitor, "get_cached_form", lambda cookies: ("", {}, 3))
+
+    class StopAfterSecondCheck(Exception):
+        pass
+
+    async def available_days(client, cookies, bot, max_date=""):
+        day_checks.append(True)
+        if len(day_checks) == 3:
+            raise StopAfterSecondCheck()
+        return [date], cookies
+
+    async def available_times(client, cookies, requested_date, retries=0):
+        time_checks.append(requested_date)
+        return [] if len(time_checks) == 1 else ["09:30"]
+
+    async def book(client, cookies, bot, requested_date, selected_time):
+        bookings.append((requested_date, selected_time))
+        return True
+
+    async def no_wait(seconds):
+        pass
+
+    monkeypatch.setattr(monitor, "fetch_available_days", available_days)
+    monkeypatch.setattr(monitor, "fetch_times_for_date", available_times)
+    monkeypatch.setattr(monitor, "try_autobook", book)
+    monkeypatch.setattr(monitor.asyncio, "sleep", no_wait)
+
+    with pytest.raises(StopAfterSecondCheck):
+        asyncio.run(monitor.main())
+
+    assert time_checks == [date, date]
+    assert bookings == [(date, "09:30")]
+
+
 def test_reschedule_posts_earlier_date(monkeypatch):
     monkeypatch.setattr(monitor, "_appointment_date", "2027-10-14")
     site = FakeSite(left=3)
@@ -480,6 +588,105 @@ def test_single_channel_keeps_retrying_connect_refusal(monkeypatch, fast_retries
     monkeypatch.setattr(monitor, "WORKER_PROXIES", ["direct"])
     dates, calls = run_days([httpx.ConnectError("refused"), ["2027-10-06"]])
     assert dates == ["2027-10-06"] and calls == 2
+
+
+def test_502_days_retry_switches_to_another_target_ip(monkeypatch, fast_retries):
+    bad, good = "18.254.10.38", "18.254.13.15"
+    calls = []
+
+    async def target_ips():
+        return [bad, good]
+
+    async def site_response(self, request):
+        calls.append(request.url.host)
+        if request.url.host == bad:
+            return httpx.Response(502, request=request)
+        return httpx.Response(200, request=request,
+                              json=[{"date": "2027-10-06", "business_day": True}])
+
+    monkeypatch.setattr(monitor, "resolve_target", target_ips)
+    monkeypatch.setattr(monitor.random, "choice", lambda ips: ips[0], raising=False)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", site_response)
+
+    async def check():
+        transport = monitor.PinnedHostTransport(label="probe")
+        async with httpx.AsyncClient(transport=transport) as client:
+            days, _ = await monitor.fetch_available_days(client, {}, FakeBot(), max_date="")
+        return days
+
+    assert asyncio.run(check()) == ["2027-10-06"]
+    assert calls == [bad, good]
+
+
+def test_502_post_is_not_retried_or_quarantined(monkeypatch):
+    ip = "18.254.10.38"
+    calls = []
+
+    async def target_ips():
+        return [ip]
+
+    async def site_response(self, request):
+        calls.append((request.method, request.url.host))
+        return httpx.Response(502, request=request)
+
+    monkeypatch.setattr(monitor, "resolve_target", target_ips)
+    monkeypatch.setattr(monitor, "PIN_TARGET_IP", True)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", site_response)
+
+    async def check():
+        transport = monitor.PinnedHostTransport(label="probe")
+        async with httpx.AsyncClient(transport=transport) as client:
+            response = await client.post(monitor.BOOKING_URL, data={"date": "2027-10-06"})
+        return response.status_code, transport._quarantine
+
+    status, quarantine = asyncio.run(check())
+    assert status == 502
+    assert calls == [("POST", ip)]
+    assert quarantine == {}
+
+
+def test_times_appearing_on_fourth_check_are_used_without_waiting_for_next_cycle(monkeypatch):
+    calls, waits = [], []
+
+    def site_response(request):
+        calls.append(request.url.path)
+        times = ["09:30"] if len(calls) == 4 else []
+        return httpx.Response(200, json={"available_times": times})
+
+    async def record_wait(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(monitor.asyncio, "sleep", record_wait)
+
+    async def check():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(site_response)) as client:
+            return await monitor.fetch_times_for_date(client, {}, "2027-10-06")
+
+    assert asyncio.run(check()) == ["09:30"]
+    assert len(calls) == 4
+    assert waits == [2, 2, 2]
+
+
+def test_times_502_is_retried_before_discarding_suitable_date(monkeypatch):
+    calls = []
+
+    def site_response(request):
+        calls.append(request.url.path)
+        if len(calls) == 1:
+            return httpx.Response(502)
+        return httpx.Response(200, json={"available_times": ["09:30"]})
+
+    async def no_wait(seconds):
+        pass
+
+    monkeypatch.setattr(monitor.asyncio, "sleep", no_wait)
+
+    async def check():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(site_response)) as client:
+            return await monitor.fetch_times_for_date(client, {}, "2027-10-06", retries=1)
+
+    assert asyncio.run(check()) == ["09:30"]
+    assert len(calls) == 2
 
 
 # --- Суточная сводка по каналам -------------------------------------------------

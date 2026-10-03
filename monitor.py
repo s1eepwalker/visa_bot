@@ -21,7 +21,6 @@ import httpx
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.error import BadRequest, NetworkError, TelegramError
-from twilio.rest import Client as TwilioClient
 
 load_dotenv()
 
@@ -103,12 +102,6 @@ MAX_DATE         = os.getenv("MAX_DATE", "")
 EMAIL            = os.getenv("EMAIL", "")
 PASSWORD         = os.getenv("PASSWORD", "")
 
-# Twilio — звонок при появлении слотов (опционально)
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN", "")
-TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")  # номер Twilio (формат +1...)
-TWILIO_TO_NUMBER   = os.getenv("TWILIO_TO_NUMBER", "")    # ваш номер (формат +7...)
-
 # Автобронирование (Фаза 1: только dry-run алерт, без реального POST)
 AUTOBOOK_ENABLED   = os.getenv("AUTOBOOK_ENABLED", "false").lower() in ("1", "true", "yes")
 AUTOBOOK_RANGES    = os.getenv("AUTOBOOK_RANGES", "")  # "today+2:2026-08-04,2026-09-03:2026-09-10"
@@ -132,10 +125,10 @@ TRANSIENT_BACKOFF = (2, 4, 7)  # базовая пауза по номеру п�
 # Прогрев формы бронирования: сколько секунд считать разобранную форму актуальной
 FORM_CACHE_TTL = int(os.getenv("FORM_CACHE_TTL", "600"))
 
-# times.json умеет возвращать пустой список на дату, которую days.json уже показывает
-# (разные кеши на стороне сайта) — поэтому пустой ответ переспрашиваем
-TIMES_RETRIES    = int(os.getenv("TIMES_RETRIES", "2"))
-TIMES_RETRY_WAIT = int(os.getenv("TIMES_RETRY_WAIT", "3"))
+# times.json умеет возвращать пустой список на дату, которую days.json уже показывает.
+# Переспрашиваем быстро: появившееся время сразу уходит в autobook, без ожидания нового цикла.
+TIMES_RETRIES    = int(os.getenv("TIMES_RETRIES", "3"))
+TIMES_RETRY_WAIT = int(os.getenv("TIMES_RETRY_WAIT", "2"))
 
 # Выходные каналы: проверки идут по кругу через разные внешние IP (SOCKS-туннели),
 # поэтому каждый адрес сохраняет прежний спокойный ритм, а суммарная частота растёт
@@ -318,9 +311,10 @@ class PinnedHostTransport(httpx.AsyncHTTPTransport):
             return self._sticky
         return random.choice(fresh)
 
-    def _mark_bad(self, ip: str, exc: Exception):
+    def _mark_bad(self, ip: str, reason: Exception | str):
         if self._quarantine.get(ip, 0) <= time.monotonic():
-            log.warning(f"[{self._label}] адрес {ip} не пускает ({type(exc).__name__}), "
+            name = reason if isinstance(reason, str) else type(reason).__name__
+            log.warning(f"[{self._label}] адрес {ip} не пускает ({name}), "
                         f"карантин {IP_QUARANTINE}с")
             _channel_stats.note_quarantine(self._label)
         self._quarantine[ip] = time.monotonic() + IP_QUARANTINE
@@ -355,7 +349,11 @@ class PinnedHostTransport(httpx.AsyncHTTPTransport):
                 last_exc = e
                 self._mark_bad(ip, e)
             else:
-                self._mark_good(ip)
+                if request.method == "GET" and response.status_code == 502:
+                    # Вызывающий код уже повторяет GET; следующий запрос пойдёт на другой IP.
+                    self._mark_bad(ip, "HTTP 502")
+                else:
+                    self._mark_good(ip)
                 return response
             finally:
                 request.url = original_url  # дальше по стеку httpx ждёт исходный URL
@@ -608,7 +606,7 @@ async def fetch_available_days(client, cookies, bot, max_date: str = MAX_DATE):
 
 
 async def fetch_times_for_date(client, cookies, date, retries: int = TIMES_RETRIES):
-    """Времена на дату. Пустой ответ повторяем: days.json бывает свежее кеша times.json."""
+    """Времена на дату. Пустой ответ и 502 повторяем, пока дата ещё может стать доступной."""
     for attempt in range(retries + 1):
         try:
             resp = await client.get(TIMES_URL.format(date=date), headers=build_headers(cookies), timeout=30)
@@ -616,6 +614,14 @@ async def fetch_times_for_date(client, cookies, date, retries: int = TIMES_RETRI
                 pause = note_rate_limit()
                 log.warning(f"HTTP 429 при запросе времён для {date}. Пауза {pause} сек после текущей итерации.")
                 return []
+            if resp.status_code == 502:
+                if attempt == retries:
+                    log.error(f"HTTP 502 при запросе времён для {date} после {retries} повторов")
+                    return []
+                log.warning(f"HTTP 502 при запросе времён для {date}, повтор "
+                            f"{attempt + 1}/{retries} через {TIMES_RETRY_WAIT}с")
+                await asyncio.sleep(TIMES_RETRY_WAIT)
+                continue
             resp.raise_for_status()
             times = resp.json().get("available_times", [])
         except Exception as e:
@@ -682,6 +688,49 @@ async def report_all_dates(bot, all_dates, new_dates: set, reason: str, grew: bo
         f"всего дат {len(sorted_all)}: {', '.join(sorted_all) or '—'}"
     )
     return delivered
+
+
+async def notify_new_dates(client, cookies: dict, bot, new_dates: set[str],
+                           times_cache: dict[str, list[str]]):
+    """Срочный алерт только для дат с подтверждённым временем."""
+    confirmed, unconfirmed = [], []
+    for date in sorted(new_dates)[:3]:
+        times = (times_cache[date] if date in times_cache
+                 else await fetch_times_for_date(client, cookies, date, retries=0))
+        if not times:
+            unconfirmed.append(f"  📅 <b>{date}</b>: время пока не подтверждено")
+            continue
+
+        time_str = ", ".join(times[:5])
+        if len(times) > 5:
+            time_str += f" (+{len(times)-5} ещё)"
+        deep_link = (
+            f"{BOOKING_URL}?"
+            f"appointments[consulate_appointment][facility_id]=134&"
+            f"appointments[consulate_appointment][date]={date}&"
+            f"appointments[consulate_appointment][time]={times[0]}"
+        )
+        confirmed.append(f"  📅 <a href='{deep_link}'><b>{date}</b></a>: {time_str}")
+
+    if confirmed:
+        msg = (
+            "🚨 <b>СЛОТЫ ПОЯВИЛИСЬ!</b>\n\n"
+            + "\n".join(confirmed)
+            + f"\n\n🔗 <a href='{BOOKING_URL}'>Забронировать сейчас →</a>\n\n"
+            "⚡️ Действуйте быстро — слоты разбирают за минуты!"
+        )
+        await send_telegram(bot, msg)
+
+    extra = len(new_dates) - min(len(new_dates), 3)
+    if unconfirmed or extra:
+        lines = unconfirmed[:]
+        if extra:
+            lines.append(f"  ...и ещё {extra} дат, время не проверено")
+        msg = "📅 <b>Новые даты в календаре</b>\n\n" + "\n".join(lines)
+        await send_telegram(bot, msg)
+
+    log.info("Новые даты: %s; время подтверждено для %s, не подтверждено для %s, "
+             "не проверено для %s", sorted(new_dates), len(confirmed), len(unconfirmed), extra)
 
 
 def parse_autobook_ranges(s: str) -> list[tuple[str, str]]:
@@ -1078,23 +1127,6 @@ async def try_autobook(client, cookies: dict, bot, date: str, time: str) -> bool
     return False
 
 
-def send_twilio_sms(dates: list[str]):
-    """Отправляет SMS через Twilio с датами слотов."""
-    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, TWILIO_TO_NUMBER]):
-        return
-    try:
-        twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        dates_text = ", ".join(dates[:3])
-        twilio.messages.create(
-            to=TWILIO_TO_NUMBER,
-            from_=TWILIO_FROM_NUMBER,
-            body=f"🚨 СЛОТЫ НА ВИЗУ! Даты: {dates_text}. Откройте Telegram для деталей.",
-        )
-        log.info("Twilio SMS отправлено на %s", TWILIO_TO_NUMBER)
-    except Exception as e:
-        log.error("Ошибка Twilio SMS: %s", e)
-
-
 async def main():
     if not TELEGRAM_TOKEN:
         log.error("Задайте TELEGRAM_TOKEN в .env!")
@@ -1273,32 +1305,7 @@ async def main():
                             break
 
                 if new_dates:
-                    details = []
-                    for date in sorted(new_dates)[:3]:
-                        times = times_cache.get(date) or await fetch_times_for_date(client, cookies, date, retries=0)
-                        time_str = ", ".join(times[:5]) if times else "нет данных"
-                        if len(times) > 5:
-                            time_str += f" (+{len(times)-5} ещё)"
-                        # Прямая ссылка с датой/временем в query — usvisa-info подхватит как hint
-                        first_time = times[0] if times else ""
-                        deep_link = (
-                            f"{BOOKING_URL}?"
-                            f"appointments[consulate_appointment][facility_id]=134&"
-                            f"appointments[consulate_appointment][date]={date}&"
-                            f"appointments[consulate_appointment][time]={first_time}"
-                        )
-                        details.append(f"  📅 <a href='{deep_link}'><b>{date}</b></a>: {time_str}")
-
-                    extra = f"\n  ...и ещё {len(new_dates)-3} дат" if len(new_dates) > 3 else ""
-                    msg = (
-                        "🚨 <b>СЛОТЫ ПОЯВИЛИСЬ!</b>\n\n"
-                        + "\n".join(details) + extra
-                        + f"\n\n🔗 <a href='{BOOKING_URL}'>Забронировать сейчас →</a>\n\n"
-                        "⚡️ Действуйте быстро — слоты разбирают за минуты!"
-                    )
-                    await send_telegram(bot, msg)
-                    send_twilio_sms(sorted(new_dates))
-                    log.info(f"Найдены новые слоты: {sorted(new_dates)}")
+                    await notify_new_dates(client, cookies, bot, new_dates, times_cache)
                 elif available:
                     log.info(f"Слоты уже известны ({len(available)} дат), ждём новых...")
                 else:
